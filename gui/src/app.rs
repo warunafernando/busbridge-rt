@@ -180,9 +180,20 @@ impl App {
                         self.wave_err = Some(e);
                     }
                 }
-                Evt::Marks(m, hz) => {
-                    self.marks = m;
+                Evt::Marks(mut m, hz) => {
+                    // Appended, not replaced. Each peek sees only what has not
+                    // been drained yet, so a replace would show the last fifty
+                    // milliseconds and call it the trace.
+                    //
+                    // The timestamps are deltas from the ring's t0, which does
+                    // not move until the next arm, so marks from different
+                    // polls share an origin and can simply be concatenated.
                     self.marks_hz = hz;
+                    self.marks.append(&mut m);
+                    if self.marks.len() > MAX_EVENTS {
+                        let n = self.marks.len() - MAX_EVENTS;
+                        self.marks.drain(..n);
+                    }
                 }
                 Evt::Status(s) => self.status = s,
                 Evt::Error(e) => self.err = Some(e),
@@ -285,60 +296,71 @@ impl App {
     }
 
     fn tab_board(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Boards");
-        ui.label(
-            RichText::new(
-                "A board's USB interface belongs to one process at a time. If one \
-                 will not open, the bench console or a script probably has it.",
-            )
-            .weak(),
-        );
-        ui.add_space(6.0);
-        if ui.button("Rescan").clicked() {
-            self.rescan();
-        }
-        ui.add_space(6.0);
-
-        if self.boards.is_empty() {
-            ui.label("none attached.");
-            return;
-        }
-        let boards: Vec<(String, String)> = self
-            .boards
-            .iter()
-            .map(|b| (b.serial.clone(), b.port.clone()))
-            .collect();
-        for (serial, port) in boards {
+        style::card(ui, "attached", |ui| {
             ui.horizontal(|ui| {
-                let sel = self.picked.as_deref() == Some(serial.as_str());
-                if ui
-                    .selectable_label(sel, format!("{}  ({port})", &serial[..12.min(serial.len())]))
-                    .clicked()
-                {
-                    self.picked = Some(serial.clone());
+                if ui.button("Rescan").clicked() {
+                    self.rescan();
                 }
-                if ui.button("Connect").clicked() {
-                    self.send(Req::Connect(serial.clone()));
+                style::right(ui, |ui| {
+                    style::chip(ui, "found", &self.boards.len().to_string(), Palette::DATA);
+                });
+            });
+            ui.add_space(6.0);
+
+            if self.boards.is_empty() {
+                style::note(ui, Palette::WARN, "No board is attached over USB.");
+                return;
+            }
+            let boards: Vec<(String, String)> = self
+                .boards
+                .iter()
+                .map(|b| (b.serial.clone(), b.port.clone()))
+                .collect();
+            let here = self.connected.as_ref().map(|(s, _, _)| s.clone());
+            for (serial, port) in boards {
+                let live = here.as_deref() == Some(serial.as_str());
+                ui.horizontal(|ui| {
+                    let dot = if live { Palette::GOOD } else { Palette::FAINT };
+                    let (r, _) =
+                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    ui.painter().circle_filled(r.center(), 4.0, dot);
+                    ui.label(
+                        RichText::new(&serial[..14.min(serial.len())])
+                            .monospace()
+                            .color(if live { Palette::TEXT } else { Palette::DIM }),
+                    );
+                    ui.label(RichText::new(port).color(Palette::FAINT).small());
+                    style::right(ui, |ui| {
+                        if live {
+                            if ui.button("Disconnect").clicked() {
+                                self.send(Req::Disconnect);
+                            }
+                            style::chip(ui, "", "connected", Palette::GOOD);
+                        } else if ui.button("Connect").clicked() {
+                            self.picked = Some(serial.clone());
+                            self.send(Req::Connect(serial.clone()));
+                        }
+                    });
+                });
+            }
+        });
+
+        ui.add_space(8.0);
+
+        if let Some((_, board, ident)) = self.connected.clone() {
+            style::card(ui, board.label(), |ui| {
+                ui.label(RichText::new(&ident).monospace().color(Palette::DIM).small());
+                if !board.has_capture_engine() {
+                    ui.add_space(6.0);
+                    style::note(ui, Palette::WARN,
+                        "No CM7 capture engine on this board. Capture, trace and files are RT1186-only and stay disabled; the console works as usual.");
                 }
             });
-        }
-
-        if let Some((_, board, ident)) = &self.connected {
-            ui.add_space(10.0);
-            ui.separator();
-            ui.label(RichText::new(board.label()).strong());
-            ui.label(RichText::new(ident).monospace().weak());
-            if !board.has_capture_engine() {
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(
-                        "No CM7 capture engine on this board. The capture, trace and \
-                         file tabs are RT1186-only and will stay disabled; everything \
-                         in the console works as usual.",
-                    )
-                    .color(Color32::from_rgb(220, 180, 90)),
-                );
-            }
+        } else {
+            style::card(ui, "", |ui| {
+                style::note(ui, Palette::DIM,
+                    "A board's USB interface belongs to one process at a time. If one will not open, the bench console or a script probably has it.");
+            });
         }
     }
 
@@ -429,6 +451,7 @@ impl App {
                             self.pushed = Some(self.cfg.clone());
                         }
                         self.events.clear();
+                        self.marks.clear();
                         self.send(Req::Clear);
                         if self.wave_on {
                             // SNIFF:RAW:START restarts the capture core itself,
@@ -448,6 +471,7 @@ impl App {
                     }
                     if ui.button("Clear").clicked() {
                         self.events.clear();
+                        self.marks.clear();
                         self.edges.clear();
                         self.send(Req::Clear);
                     }
@@ -572,182 +596,168 @@ impl App {
 
     fn tab_trace(&mut self, ui: &mut egui::Ui) {
         let rt = self.is_rt();
-        ui.heading("Source & controller trace");
-        ui.label(
-            RichText::new(
-                "Where a record came from, kept apart from what it says. `wire` is \
-                 a measurement; `controller` is what our own peripheral accepted. \
-                 They differ exactly when something is wrong.",
-            )
-            .weak(),
-        );
-        ui.add_space(6.0);
-
-        ui.add_enabled_ui(rt, |ui| {
-            ui.horizontal(|ui| {
-                for (s, hint) in [
-                    ("wire", "FlexIO samples the tap pads. Sees everything on the bus, including other controllers. Needs the taps wired."),
-                    ("self", "The controller's own transfers, recorded as it drives them. No taps at all - it works while the bus is in use because it IS the bus in use."),
-                    ("both", "Both engines over one window, each keeping its own tag. Frames can be ordered against each other to about 1.5 us; events inside a frame cannot."),
-                ] {
-                    if ui.selectable_label(self.cfg.source == s, s).on_hover_text(hint).clicked() {
-                        self.cfg.source = s.into();
+        style::card(ui, "source", |ui| {
+            style::note(ui, Palette::DIM,
+                "Where a record came from, kept apart from what it says. `wire` is a measurement; `controller` is what our own peripheral accepted. They differ exactly when something is wrong.");
+            ui.add_space(8.0);
+            ui.add_enabled_ui(rt, |ui| {
+                ui.horizontal(|ui| {
+                    let mut src = self.cfg.source.clone();
+                    if style::segmented(ui, &mut src, &[
+                        ("wire", "FlexIO samples the tap pads. Sees everything on the bus, including other controllers. Needs the taps wired."),
+                        ("self", "The controller's own transfers, recorded as it drives them. No taps at all - it works while the bus is in use because it IS the bus in use."),
+                        ("both", "Both engines over one window, each keeping its own tag. Frames can be ordered against each other to about 1.5 us; events inside a frame cannot."),
+                    ]) {
+                        self.cfg.source = src;
                     }
-                }
-                ui.separator();
-                if ui.button("Read trace").clicked() {
-                    self.send(Req::ReadTrace);
-                }
+                    ui.add_space(6.0);
+                    if ui.button("Read trace").clicked() {
+                        self.send(Req::ReadTrace);
+                    }
+                    style::right(ui, |ui| {
+                        style::chip(ui, "marks", &self.marks.len().to_string(), Palette::DATA);
+                    });
+                });
             });
+            if self.cfg.source != "wire" {
+                ui.add_space(8.0);
+                style::note(ui, Palette::WARN,
+                    "A controller-side T-bit is computed from the byte it belongs to, so it agrees by construction and can never fail. Marks below say which flags were computed.");
+            }
         });
 
-        if self.cfg.source != "wire" {
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new(
-                    "A controller-side T-bit is computed from the byte it belongs to, \
-                     so it agrees by construction and can never fail. Marks below \
-                     carry ~ where the flag was computed rather than observed.",
-                )
-                .color(Color32::from_rgb(220, 180, 90)),
-            );
-        }
+        ui.add_space(8.0);
 
-        ui.add_space(6.0);
-        ui.separator();
-        if self.marks.is_empty() {
-            ui.label(RichText::new("no trace read yet.").weak());
-            return;
-        }
-        let t0 = self.marks.first().map(|m| m.dt_cycles).unwrap_or(0);
-        let hz = self.marks_hz.max(1) as f64;
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("marks").num_columns(3).striped(true).show(ui, |ui| {
-                ui.label(RichText::new("t (us)").strong());
-                ui.label(RichText::new("token").strong());
-                ui.label(RichText::new("flag").strong());
-                ui.end_row();
-                for m in &self.marks {
-                    let us = (m.dt_cycles.saturating_sub(t0)) as f64 / hz * 1e6;
-                    ui.label(RichText::new(format!("{us:9.3}")).monospace());
-                    ui.label(RichText::new(&m.token).monospace());
-                    if m.derived {
-                        ui.label(
-                            RichText::new("computed")
-                                .color(Color32::from_rgb(220, 180, 90))
-                                .small(),
-                        );
-                    } else {
-                        ui.label(RichText::new("observed").weak().small());
-                    }
-                    ui.end_row();
-                }
+        style::card(ui, "controller trace", |ui| {
+            if self.marks.is_empty() {
+                style::note(ui, Palette::DIM,
+                    "Nothing yet. Set the source to `self` or `both`, start a capture, and drive a transfer - marks arrive while it runs. `Read trace` asks for them once.");
+                return;
+            }
+            let t0 = self.marks.first().map(|m| m.dt_cycles).unwrap_or(0);
+            let hz = self.marks_hz.max(1) as f64;
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::Grid::new("marks")
+                    .num_columns(3)
+                    .striped(true)
+                    .spacing([18.0, 3.0])
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("TIME").color(Palette::FAINT).small().strong());
+                        ui.label(RichText::new("TOKEN").color(Palette::FAINT).small().strong());
+                        ui.label(RichText::new("NINTH BIT").color(Palette::FAINT).small().strong());
+                        ui.end_row();
+                        for m in &self.marks {
+                            let us = (m.dt_cycles.saturating_sub(t0)) as f64 / hz * 1e6;
+                            ui.label(
+                                RichText::new(format!("{us:9.3} us"))
+                                    .monospace()
+                                    .color(Palette::DIM),
+                            );
+                            ui.label(RichText::new(&m.token).monospace().color(token_colour(&m.token)));
+                            if m.derived {
+                                ui.label(RichText::new("computed").color(Palette::WARN).small());
+                            } else {
+                                ui.label(RichText::new("observed").color(Palette::GOOD).small());
+                            }
+                            ui.end_row();
+                        }
+                    });
             });
         });
     }
 
     fn tab_files(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Capture files");
-        ui.label(
-            RichText::new(
-                "Recording and decoding stay in the scripts and the analyser rather \
-                 than being reimplemented here. A window that disagreed with the \
-                 terminal would be worse than no window.",
-            )
-            .weak(),
-        );
-        ui.add_space(8.0);
-
         let busy = self.runs.iter().any(|r| !r.done);
-        ui.add_enabled_ui(self.is_rt() && !busy, |ui| {
-            ui.horizontal(|ui| {
-                if ui
-                    .button("Record (oversampled)")
-                    .on_hover_text("scripts/capture.py - measured timing, exact below ~3 MHz")
-                    .clicked()
-                {
-                    self.start_script("capture.py", &[]);
-                }
-                if ui
-                    .button("Record (pin-clocked)")
-                    .on_hover_text(
-                        "scripts/pinclock_cap.py - reconstructs a file for rates too \
-                         fast to oversample. Its timing is INVENTED and the file says so.",
-                    )
-                    .clicked()
-                {
-                    self.start_script("pinclock_cap.py", &[]);
-                }
+        style::card(ui, "record", |ui| {
+            style::note(ui, Palette::DIM,
+                "Recording and decoding stay in the scripts and the analyser rather than being reimplemented here. A window that disagreed with the terminal would be worse than no window.");
+            ui.add_space(8.0);
+            ui.add_enabled_ui(self.is_rt() && !busy, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Oversampled")
+                        .on_hover_text("scripts/capture.py - measured timing, exact below ~3 MHz")
+                        .clicked()
+                    {
+                        self.start_script("capture.py", &[]);
+                    }
+                    if ui.button("Pin-clocked")
+                        .on_hover_text("scripts/pinclock_cap.py - reconstructs a file for rates too fast to oversample. Its timing is INVENTED and the file says so.")
+                        .clicked()
+                    {
+                        self.start_script("pinclock_cap.py", &[]);
+                    }
+                });
             });
         });
 
-        ui.add_space(10.0);
-        ui.label("Open a .cap in the analyser");
-        ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.cap_path).desired_width(360.0))
-                .on_hover_text("Path to a .cap file");
-            if ui.button("Show").clicked() {
-                let p = self.cap_path.clone();
-                let exe = self.sniffer_exe.clone();
-                if p.is_empty() {
-                    self.err = Some("no file named".into());
-                } else if !std::path::Path::new(&exe).exists() {
-                    self.err = Some(format!(
-                        "analyser not found at {exe} - build it in the sniffer tree, \
-                         or set SNIFFER_EXE"
-                    ));
-                } else {
-                    let _ = std::process::Command::new(&exe).arg("show").arg(&p).spawn();
-                }
-            }
-        });
-        ui.label(
-            RichText::new(
-                "A file built from a pin-clocked capture carries synthetic timing and \
-                 warns on open. That mode records no transition times, so the timing \
-                 in such a file is reconstructed, not measured.",
-            )
-            .weak()
-            .small(),
-        );
+        ui.add_space(8.0);
 
-        ui.add_space(10.0);
-        ui.separator();
+        style::card(ui, "open", |ui| {
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.cap_path)
+                        .desired_width(400.0)
+                        .font(egui::TextStyle::Monospace)
+                        .hint_text("path to a .cap file"),
+                );
+                if ui.button("Show in analyser").clicked() {
+                    let p = self.cap_path.clone();
+                    let exe = self.sniffer_exe.clone();
+                    if p.is_empty() {
+                        self.err = Some("no file named".into());
+                    } else if !std::path::Path::new(&exe).exists() {
+                        self.err = Some(format!(
+                            "analyser not found at {exe} - build it in the sniffer tree, or set SNIFFER_EXE"
+                        ));
+                    } else {
+                        let _ = std::process::Command::new(&exe).arg("show").arg(&p).spawn();
+                    }
+                }
+            });
+            ui.add_space(6.0);
+            style::note(ui, Palette::WARN,
+                "A file built from a pin-clocked capture carries synthetic timing and warns on open. That mode records no transition times, so the timing in such a file is reconstructed, not measured.");
+        });
+
+        ui.add_space(8.0);
         self.runs_view(ui);
     }
 
     fn tab_bench(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Bench measurements");
-        ui.label(
-            RichText::new(
-                "These hold the board for as long as they run, so connecting here is \
-                 disconnected first. Each is the same script the documentation cites.",
-            )
-            .weak(),
-        );
-        ui.add_space(8.0);
-
         let busy = self.runs.iter().any(|r| !r.done);
-        ui.add_enabled_ui(!busy, |ui| {
-            egui::Grid::new("bench").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+        style::card(ui, "measurements", |ui| {
+            style::note(ui, Palette::DIM,
+                "These hold the board for as long as they run, so this window disconnects first. Each is the same script the documentation cites.");
+            ui.add_space(8.0);
+            ui.add_enabled_ui(!busy, |ui| {
                 for (script, args, what) in [
                     ("acceptance.py", vec![], "The whole suite: 66 checks, both boards attached."),
                     ("self_trace.py", vec![], "Does the controller trace say what the wire says, and admit what it cannot see?"),
-                    ("clock_offset.py", vec!["8".to_string(), "12".into(), "2000".into()], "Where the capture core's tick 0 sits in CM33 time, and whether the clocks drift."),
-                    ("trace_lag.py", vec!["4".to_string()], "How far behind the wire the controller stamps its own events."),
-                    ("merge_both.py", vec!["3".to_string()], "A `both` capture merged into one ordered stream, with its error bar."),
+                    ("clock_offset.py", vec!["8".to_string(), "12".into(), "2000".into()],
+                        "Where the capture core's tick 0 sits in CM33 time, and whether the clocks drift."),
+                    ("trace_lag.py", vec!["4".to_string()],
+                        "How far behind the wire the controller stamps its own events."),
+                    ("merge_both.py", vec!["3".to_string()],
+                        "A `both` capture merged into one ordered stream, with its error bar."),
                 ] {
-                    if ui.button(script).clicked() {
-                        self.start_script(script, &args);
-                    }
-                    ui.label(RichText::new(what).weak().small());
-                    ui.end_row();
+                    ui.horizontal(|ui| {
+                        let (r, _) = ui.allocate_exact_size(
+                            // Wide enough for the longest script name. 132 wrapped
+                            // clock_offset.py onto two lines and made that one row
+                            // taller than the rest, which reads as emphasis.
+                            egui::vec2(152.0, 24.0), egui::Sense::hover());
+                        let btn = ui.put(r, egui::Button::new(
+                            RichText::new(script).monospace()));
+                        if btn.clicked() {
+                            self.start_script(script, &args);
+                        }
+                        ui.label(RichText::new(what).color(Palette::DIM).small());
+                    });
                 }
             });
         });
 
-        ui.add_space(10.0);
-        ui.separator();
+        ui.add_space(8.0);
         self.runs_view(ui);
     }
 
@@ -766,39 +776,56 @@ impl App {
     }
 
     fn runs_view(&mut self, ui: &mut egui::Ui) {
+        if self.runs.is_empty() {
+            return;
+        }
         let mut stop_idx = None;
         for (i, r) in self.runs.iter().enumerate().rev() {
-            ui.horizontal(|ui| {
-                let c = match r.verdict() {
-                    "passed" => Color32::from_rgb(120, 200, 120),
-                    "FAILED" => Color32::from_rgb(220, 90, 90),
-                    _ => Color32::GRAY,
-                };
-                ui.label(RichText::new(&r.title).strong());
-                ui.label(RichText::new(r.verdict()).color(c));
-                if !r.done && ui.small_button("stop").clicked() {
-                    stop_idx = Some(i);
-                }
-            });
-            egui::ScrollArea::vertical()
-                .id_salt(format!("run{i}"))
-                .max_height(240.0)
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    for l in &r.lines {
-                        let c = if l.starts_with('!') {
-                            Color32::from_rgb(220, 90, 90)
-                        } else if l.contains("FAIL") {
-                            Color32::from_rgb(220, 90, 90)
-                        } else if l.contains("PASS") {
-                            Color32::from_rgb(120, 200, 120)
-                        } else {
-                            ui.visuals().text_color()
-                        };
-                        ui.label(RichText::new(l).monospace().color(c));
+            style::card(ui, "", |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&r.title).monospace().strong());
+                    if !r.done && ui.small_button("stop").clicked() {
+                        stop_idx = Some(i);
                     }
+                    style::right(ui, |ui| {
+                        let (c, v) = match r.verdict() {
+                            "passed" => (Palette::GOOD, "passed"),
+                            "FAILED" => (Palette::BAD, "FAILED"),
+                            "stopped" => (Palette::WARN, "stopped"),
+                            _ => (Palette::ACCENT, "running"),
+                        };
+                        style::chip(ui, "", v, c);
+                        style::chip(ui, "lines", &r.lines.len().to_string(), Palette::DIM);
+                    });
                 });
-            ui.separator();
+                ui.add_space(4.0);
+                egui::Frame::new()
+                    .fill(Palette::PLOT_BG)
+                    .corner_radius(egui::CornerRadius::same(5))
+                    .inner_margin(egui::Margin::same(7))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        egui::ScrollArea::vertical()
+                            .id_salt(format!("run{i}"))
+                            .max_height(250.0)
+                            .stick_to_bottom(true)
+                            .show(ui, |ui| {
+                                for l in &r.lines {
+                                    let c = if l.starts_with('!') || l.contains("FAIL") {
+                                        Palette::BAD
+                                    } else if l.contains("PASS") {
+                                        Palette::GOOD
+                                    } else if l.starts_with("==") {
+                                        Palette::ACCENT
+                                    } else {
+                                        Palette::TEXT
+                                    };
+                                    ui.label(RichText::new(l).monospace().color(c));
+                                }
+                            });
+                    });
+            });
+            ui.add_space(8.0);
         }
         if let Some(i) = stop_idx {
             self.runs[i].stop();
@@ -806,11 +833,13 @@ impl App {
     }
 
     fn console(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.label("Command");
+            ui.label(RichText::new("\u{203a}").color(Palette::ACCENT).monospace().strong());
             let r = ui.add(
                 egui::TextEdit::singleline(&mut self.raw_entry)
-                    .desired_width(ui.available_width() - 90.0)
+                    .desired_width(ui.available_width() - 84.0)
+                    .font(egui::TextStyle::Monospace)
                     .hint_text("SNIFF:STAT?"),
             );
             let send = (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
@@ -821,24 +850,45 @@ impl App {
                 r.request_focus();
             }
         });
+        ui.add_space(4.0);
         egui::ScrollArea::vertical()
             .id_salt("log")
             .stick_to_bottom(true)
+            .auto_shrink([false, false])
             .show(ui, |ui| {
                 for (cmd, reply) in &self.log {
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new(format!("> {cmd}")).monospace().weak());
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.label(RichText::new("\u{203a}").color(Palette::FAINT).monospace());
+                        ui.label(RichText::new(cmd).monospace().color(Palette::DIM));
                     });
                     let c = if reply.starts_with("ERR") {
-                        Color32::from_rgb(220, 90, 90)
+                        Palette::BAD
                     } else {
-                        ui.visuals().text_color()
+                        Palette::TEXT
                     };
                     ui.horizontal_wrapped(|ui| {
                         ui.label(RichText::new(reply).monospace().color(c));
                     });
                 }
             });
+    }
+
+}
+
+/// What colour a token is, in one place.
+///
+/// The event stream and the trace table show the same vocabulary and must
+/// colour it the same way: a `D40+` that is green in one view and plain in the
+/// other reads as two different things.
+fn token_colour(t: &str) -> Color32 {
+    match t {
+        "S" | "Sr" => Palette::CLOCK,
+        "P" => Palette::FAINT,
+        "!" => Palette::BAD,
+        _ if t.starts_with('A') => Palette::ADDR,
+        _ if t.starts_with('C') => Palette::CCC,
+        _ => Palette::DATA,
     }
 }
 
@@ -865,24 +915,26 @@ fn secs(t: f64) -> String {
 /// STARTs the same colour reads as one long transfer, and the thing a person
 /// is usually looking for is where the frames begin.
 fn events_view(ui: &mut egui::Ui, events: &[String]) {
-    egui::ScrollArea::vertical()
-        .id_salt("events")
-        .stick_to_bottom(true)
-        .auto_shrink([false, false])
+    egui::Frame::new()
+        .fill(Palette::PLOT_BG)
+        .corner_radius(egui::CornerRadius::same(5))
+        .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                for t in events {
-                    let c = match t.as_str() {
-                        "S" | "Sr" => Color32::from_rgb(120, 190, 240),
-                        "P" => Color32::from_rgb(150, 150, 170),
-                        "!" => Color32::from_rgb(220, 90, 90),
-                        _ if t.starts_with('A') => Color32::from_rgb(230, 200, 120),
-                        _ if t.starts_with('C') => Color32::from_rgb(200, 140, 230),
-                        _ => ui.visuals().text_color(),
-                    };
-                    ui.label(RichText::new(t).monospace().color(c));
-                }
-            });
+            ui.set_width(ui.available_width());
+            ui.set_min_height(54.0);
+            egui::ScrollArea::vertical()
+                .id_salt("events")
+                .stick_to_bottom(true)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 5.0;
+                        for t in events {
+                            ui.label(
+                                RichText::new(t).monospace().color(token_colour(t)),
+                            );
+                        }
+                    });
+                });
         });
 }

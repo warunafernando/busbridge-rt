@@ -110,6 +110,10 @@ fn run(rx: Receiver<Req>, tx: Sender<Evt>) {
     let mut dev: Option<Device> = None;
     let mut following = false;
     let mut raw = false;
+    // Whether the controller trace is one of the running engines. Set from the
+    // configuration rather than asked for separately, so it cannot disagree
+    // with what the board was actually told.
+    let mut tracing = false;
     let mut next_poll = Instant::now();
 
     loop {
@@ -189,6 +193,9 @@ fn run(rx: Receiver<Req>, tx: Sender<Evt>) {
                     }
                 }
                 other => {
+                    if let Req::Configure(ref c) = other {
+                        tracing = c.source != "wire";
+                    }
                     let Some(d) = dev.as_ref() else {
                         let _ = tx.send(Evt::Error("not connected".into()));
                         continue;
@@ -201,6 +208,18 @@ fn run(rx: Receiver<Req>, tx: Sender<Evt>) {
         if following {
             if let Some(d) = dev.as_ref() {
                 if Instant::now() >= next_poll {
+                    // Peek BEFORE draining, and only in a mode that has a
+                    // trace to peek.
+                    //
+                    // In `self` and `both` the controller ring is what
+                    // SNIFF:READ? drains, so the live event poll was eating
+                    // the very events the trace view peeks at - press Read
+                    // trace after a capture and it answered n=0 while the
+                    // events sat on screen beside it. Peeking first means the
+                    // marks are exactly what the drain is about to take.
+                    if tracing {
+                        peek_trace(d, &tx);
+                    }
                     drain_events(d, &tx);
                     if raw {
                         drain_raw(d, &tx);
@@ -348,6 +367,23 @@ fn drain_raw(d: &Device, tx: &Sender<Evt>) {
             // immediately would spin against an idle bus.
             return;
         }
+    }
+}
+
+/// Peek the controller trace without consuming it.
+///
+/// Quiet - no entry in the transcript. This runs twenty times a second while a
+/// capture is live, and a log that is nine tenths its own polling is a log
+/// nobody reads.
+fn peek_trace(d: &Device, tx: &Sender<Evt>) {
+    let r = d.command("SNIFF:TRACE? 60");
+    if !Device::ok(&r) {
+        return;
+    }
+    let m = device::marks(&r);
+    if !m.is_empty() {
+        let hz = device::field_u64(&r, "cycle_hz=").unwrap_or(240_000_000);
+        let _ = tx.send(Evt::Marks(m, hz));
     }
 }
 
