@@ -17,6 +17,7 @@ mod device;
 mod ffi;
 mod runner;
 mod smoke;
+mod wave;
 mod worker;
 
 fn main() -> eframe::Result<()> {
@@ -40,10 +41,12 @@ fn main() -> eframe::Result<()> {
     // the same flag for the same reason.
     let mut connect = None;
     let mut smoke = false;
+    let mut wave = false;
     let mut argv = std::env::args().skip(1);
     while let Some(a) = argv.next() {
         match a.as_str() {
             "--connect" => connect = argv.next(),
+            "--wave" => wave = true,
             "--smoke" => {
                 smoke = true;
                 connect = argv.next();
@@ -51,6 +54,7 @@ fn main() -> eframe::Result<()> {
             "--help" | "-h" => {
                 eprintln!("busbridge-rt-gui [--connect <serial>] [--smoke <serial>]");
                 eprintln!("  --smoke  drive the capture path with no window, and exit");
+                eprintln!("  --wave   open with the waveform panel already on");
                 eprintln!("  BUSBRIDGE_SCRIPTS  where the bench scripts live");
                 eprintln!("  SNIFFER_EXE        the waveform analyser, for Files");
                 return Ok(());
@@ -75,6 +79,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "busbridge-rt-gui",
         opts,
-        Box::new(move |_cc| Ok(Box::new(app::App::new(scripts, connect)))),
+        Box::new(move |_cc| Ok(Box::new(app::App::new(scripts, connect, wave)))),
     )
 }

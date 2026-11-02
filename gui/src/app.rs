@@ -18,6 +18,7 @@ use egui::{Color32, RichText};
 
 use crate::device::{self, Board, Mark};
 use crate::runner::Run;
+use crate::wave::{self, Edges, View};
 use crate::worker::{self, CaptureCfg, Evt, Req};
 
 const MAX_EVENTS: usize = 20_000;
@@ -51,6 +52,11 @@ pub struct App {
     marks: Vec<Mark>,
     marks_hz: u64,
 
+    wave_on: bool,
+    edges: Edges,
+    view: View,
+    wave_err: Option<String>,
+
     log: Vec<(String, String)>,
     raw_entry: String,
 
@@ -61,7 +67,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(scripts_dir: String, connect: Option<String>) -> App {
+    pub fn new(scripts_dir: String, connect: Option<String>, wave: bool) -> App {
         let (tx, rx) = worker::spawn();
         let mut a = App {
             tx,
@@ -78,6 +84,10 @@ impl App {
             status: String::new(),
             marks: Vec::new(),
             marks_hz: 240_000_000,
+            wave_on: wave,
+            edges: Edges::default(),
+            view: View::default(),
+            wave_err: None,
             log: Vec::new(),
             raw_entry: String::new(),
             runs: Vec::new(),
@@ -153,6 +163,20 @@ impl App {
                     if self.events.len() > MAX_EVENTS {
                         let n = self.events.len() - MAX_EVENTS;
                         self.events.drain(..n);
+                    }
+                }
+                Evt::RawArmed(hz) => {
+                    self.edges.clear();
+                    self.edges.tick_hz = hz;
+                    self.view = View::default();
+                    self.wave_err = None;
+                }
+                Evt::RawData(reply) => {
+                    if let Err(e) = self.edges.push_reply(&reply) {
+                        // Reported, not swallowed. A malformed edge record is
+                        // a transport fault, and this project has paid once
+                        // for a truncated reply parsed into plausible data.
+                        self.wave_err = Some(e);
                     }
                 }
                 Evt::Marks(m, hz) => {
@@ -392,7 +416,16 @@ impl App {
                     }
                     self.events.clear();
                     self.send(Req::Clear);
-                    self.send(Req::Start);
+                    if self.wave_on {
+                        // SNIFF:RAW:START restarts the capture core itself, so
+                        // it stands in for SNIFF:START rather than following
+                        // it. Sending both would start the capture twice and
+                        // throw away the first.
+                        self.edges.clear();
+                        self.send(Req::RawStart(200_000));
+                    } else {
+                        self.send(Req::Start);
+                    }
                     self.running = true;
                 }
                 if ui.add_enabled(self.running, egui::Button::new("Stop")).clicked() {
@@ -405,6 +438,27 @@ impl App {
                 }
                 if ui.button("Status").clicked() {
                     self.send(Req::Status);
+                }
+                ui.separator();
+                // Pin-clocked capture skips the raw sample store while it is
+                // decoding - that is what bought 6 to 8 MHz - so asking for
+                // both gets an empty trace rather than an error. Refusing the
+                // combination here is better than drawing nothing and letting
+                // it look like a dead bus.
+                let blocked = self.cfg.mode == "pinclock" && self.cfg.decode;
+                let mut want = self.wave_on;
+                let cb = ui.add_enabled(!blocked, egui::Checkbox::new(&mut want, "Waveform"));
+                if blocked {
+                    cb.on_hover_text(
+                        "Pin-clocked capture does not store raw samples while it                          decodes. Turn decode off for a waveform, or use                          oversampled mode to have both.",
+                    );
+                } else if want != self.wave_on {
+                    self.wave_on = want;
+                    if !want {
+                        self.send(Req::RawStop);
+                    } else if self.running {
+                        self.send(Req::RawStart(200_000));
+                    }
                 }
             });
         });
@@ -426,6 +480,60 @@ impl App {
                 );
             }
         });
+        if self.wave_on {
+            ui.add_space(4.0);
+            let names: Vec<String> = self
+                .cfg
+                .taps
+                .split_whitespace()
+                .enumerate()
+                .map(|(i, t)| {
+                    // Tap 0 is the clock by the firmware's own rule, and the
+                    // label says so: a two-line trace with no clock named is a
+                    // guess the reader should not have to make.
+                    if i == 0 {
+                        format!("{t}  clk")
+                    } else {
+                        t.to_string()
+                    }
+                })
+                .collect();
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("{} edges", self.edges.list.len())).strong(),
+                );
+                ui.checkbox(&mut self.view.follow, "follow")
+                    .on_hover_text("Keep the right edge pinned to the newest sample.");
+                if ui.small_button("fit").clicked() {
+                    let (a, b) = self.edges.span_ticks();
+                    if b > a {
+                        self.view.left = a as f64;
+                        self.view.width = (b - a) as f64;
+                        self.view.follow = false;
+                    }
+                }
+                if self.cfg.mode == "pinclock" {
+                    ui.label(
+                        RichText::new(
+                            "pin-clocked: the axis is bus clocks, not time",
+                        )
+                        .color(Color32::from_rgb(220, 180, 90))
+                        .small(),
+                    );
+                }
+                if let Some(e) = &self.wave_err {
+                    ui.label(RichText::new(e).color(Color32::from_rgb(220, 90, 90)).small());
+                }
+            });
+            wave::draw(
+                ui,
+                &self.edges,
+                &mut self.view,
+                &names,
+                self.cfg.mode == "pinclock",
+            );
+            ui.add_space(4.0);
+        }
         events_view(ui, &self.events);
     }
 

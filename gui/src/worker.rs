@@ -32,6 +32,9 @@ pub enum Req {
     ReadTrace,
     /// Keep draining events until told otherwise.
     Follow(bool),
+    /// Arm the edge-list view for the waveform, with a budget in edges.
+    RawStart(u32),
+    RawStop,
     Status,
     Quit,
 }
@@ -80,6 +83,14 @@ pub enum Evt {
         reply: String,
     },
     Events(Vec<String>),
+    /// One SNIFF:RAW:READ? reply, unparsed.
+    ///
+    /// Handed over as text rather than as edges because the 32-bit tick has to
+    /// be unwrapped across replies, and that running state belongs with the
+    /// buffer it accumulates into - not duplicated here, where a second copy
+    /// could disagree with the first about where the capture started.
+    RawData(String),
+    RawArmed(u64),
     Marks(Vec<Mark>, u64),
     Status(String),
     Error(String),
@@ -98,6 +109,7 @@ pub fn spawn() -> (Sender<Req>, Receiver<Evt>) {
 fn run(rx: Receiver<Req>, tx: Sender<Evt>) {
     let mut dev: Option<Device> = None;
     let mut following = false;
+    let mut raw = false;
     let mut next_poll = Instant::now();
 
     loop {
@@ -146,12 +158,42 @@ fn run(rx: Receiver<Req>, tx: Sender<Evt>) {
                     following = on && dev.is_some();
                     next_poll = Instant::now();
                 }
+                Req::RawStart(budget) => {
+                    let Some(d) = dev.as_ref() else {
+                        let _ = tx.send(Evt::Error("not connected".into()));
+                        continue;
+                    };
+                    let line = format!("SNIFF:RAW:START {budget}");
+                    let r = d.command(&line);
+                    if Device::ok(&r) {
+                        // tick_hz is the sample clock the engine settled on,
+                        // which is not the rate that was asked for - it is
+                        // divided down from a root and the achievable value is
+                        // the engine's to choose. Drawing a time axis from the
+                        // requested rate would be a plausible wrong answer.
+                        let hz = device::field_u64(&r, "tick_hz=").unwrap_or(10_000_000);
+                        let _ = tx.send(Evt::RawArmed(hz));
+                        raw = true;
+                        following = true;
+                        next_poll = Instant::now();
+                    }
+                    say(&tx, &line, r);
+                }
+                Req::RawStop => {
+                    let was = raw;
+                    raw = false;
+                    if let Some(d) = dev.as_ref().filter(|_| was) {
+                        let r = d.command("SNIFF:RAW:STOP");
+                        say(&tx, "SNIFF:RAW:STOP", r);
+                        drain_raw(d, &tx);
+                    }
+                }
                 other => {
                     let Some(d) = dev.as_ref() else {
                         let _ = tx.send(Evt::Error("not connected".into()));
                         continue;
                     };
-                    handle(d, other, &tx, &mut following);
+                    handle(d, other, &tx, &mut following, &mut raw);
                 }
             }
         }
@@ -160,6 +202,9 @@ fn run(rx: Receiver<Req>, tx: Sender<Evt>) {
             if let Some(d) = dev.as_ref() {
                 if Instant::now() >= next_poll {
                     drain_events(d, &tx);
+                    if raw {
+                        drain_raw(d, &tx);
+                    }
                     // 50 ms: fast enough that a running capture looks live,
                     // slow enough that the drain is not most of what the board
                     // is doing. The firmware's ring is the thing that bounds
@@ -183,7 +228,7 @@ fn say(tx: &Sender<Evt>, cmd: &str, reply: String) {
     });
 }
 
-fn handle(d: &Device, req: Req, tx: &Sender<Evt>, following: &mut bool) {
+fn handle(d: &Device, req: Req, tx: &Sender<Evt>, following: &mut bool, raw: &mut bool) {
     match req {
         Req::Raw(line) => {
             let r = d.command(&line);
@@ -229,8 +274,24 @@ fn handle(d: &Device, req: Req, tx: &Sender<Evt>, following: &mut bool) {
         }
         Req::Stop => {
             *following = false;
-            let r = d.command("SNIFF:STOP");
-            say(tx, "SNIFF:STOP", r);
+            // One stop, not two.
+            //
+            // SNIFF:RAW:STOP and SNIFF:STOP both send BB_MSG_STOP to the
+            // capture core - they are the same stop wearing two names, and the
+            // only difference is that the raw one is where the edge cursor is
+            // handled. Sending both always made the second answer
+            // `capture-not-running`, which reads as a capture that died on its
+            // own.
+            let line = if *raw { "SNIFF:RAW:STOP" } else { "SNIFF:STOP" };
+            let r = d.command(line);
+            let ok = Device::ok(&r);
+            say(tx, line, r);
+            if *raw {
+                if ok {
+                    drain_raw(d, tx);
+                }
+                *raw = false;
+            }
             // One last drain: events captured just before the stop are still
             // in the ring, and a view that loses them makes a short capture
             // look like a failed one.
@@ -264,6 +325,32 @@ fn handle(d: &Device, req: Req, tx: &Sender<Evt>, following: &mut bool) {
 /// capture core hands over what it has; a read that comes back short while
 /// records are still queued is ordinary, and the caller comes back. Looping
 /// here would hold the worker in a drain while the UI waits for the frame.
+/// Take whatever edges the board has to hand, one reply's worth.
+///
+/// 79 records, because that is what a reply line holds - the firmware bounds
+/// it at BB_REPLY_BYTES_MAX and asking for more gets a refusal rather than a
+/// long line. Asking for exactly the maximum keeps the round trips down on a
+/// busy bus, where the waveform is the thing most likely to fall behind.
+fn drain_raw(d: &Device, tx: &Sender<Evt>) {
+    for _ in 0..8 {
+        let r = d.command("SNIFF:RAW:READ? 79");
+        if !Device::ok(&r) {
+            return;
+        }
+        let payload = r.strip_prefix("OK").unwrap_or("").trim();
+        if payload.is_empty() {
+            return;
+        }
+        let whole = payload.split_whitespace().count() == 79 * 5;
+        let _ = tx.send(Evt::RawData(r));
+        if !whole {
+            // Short reply: the board has handed over what it had. Coming back
+            // immediately would spin against an idle bus.
+            return;
+        }
+    }
+}
+
 fn drain_events(d: &Device, tx: &Sender<Evt>) {
     let r = d.command("SNIFF:READ? 120");
     if !Device::ok(&r) {

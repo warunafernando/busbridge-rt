@@ -139,6 +139,7 @@ pub fn run(serial_prefix: Option<String>) -> i32 {
     // Collect until the status reply arrives, which is the last thing queued.
     let mut events: Vec<String> = Vec::new();
     let mut cfg_refused = None;
+    let mut other_err: Option<String> = None;
     let mut daa = String::new();
     let mut status = String::new();
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -150,8 +151,20 @@ pub fn run(serial_prefix: Option<String>) -> i32 {
                 if cmd == "I3C:ENTDAA" {
                     daa = reply.clone();
                 }
-                if reply.starts_with("ERR") && cmd.starts_with("SNIFF:") {
+                // Only the configuration commands, named rather than
+                // matched by prefix. Keyed on "any SNIFF: error" this blamed
+                // the configuration for a refusal that came from SNIFF:STOP -
+                // a real defect, but not that one, and the label sent the
+                // first look at it to the wrong place.
+                let is_cfg = ["SNIFF:SRC", "SNIFF:CH", "SNIFF:MODE",
+                              "SNIFF:DMA", "SNIFF:DECODE", "SNIFF:RATE"]
+                    .iter()
+                    .any(|c| cmd.starts_with(c));
+                if reply.starts_with("ERR") && is_cfg {
                     cfg_refused.get_or_insert(format!("{cmd} -> {reply}"));
+                }
+                if reply.starts_with("ERR") && !is_cfg {
+                    other_err.get_or_insert(format!("{cmd} -> {reply}"));
                 }
             }
             Ok(Evt::Error(e)) => {
@@ -193,10 +206,79 @@ pub fn run(serial_prefix: Option<String>) -> i32 {
         &joined,
     );
     step(
+        "no command was refused along the way",
+        other_err.is_none(),
+        other_err.as_deref().unwrap_or(""),
+    );
+    step(
         "SNIFF:STAT? came back",
         status.starts_with("OK"),
         &status,
     );
+
+    // ---- the waveform path ------------------------------------------------
+    //
+    // Checked on the edges themselves rather than on whether anything was
+    // drawn. A trace can be drawn from a capture where one line never moved,
+    // and that is the failure worth catching: it looks like a quiet bus and it
+    // is a tap that is not connected to anything.
+    let _ = tx.send(Req::RawStart(20_000));
+    let _ = tx.send(Req::Raw("I3C:W 0x09 00 40".into()));
+    let _ = tx.send(Req::Raw("I3C:R 0x09 6".into()));
+    let _ = tx.send(Req::RawStop);
+    let _ = tx.send(Req::Status);
+
+    let mut edges = crate::wave::Edges::default();
+    let mut armed = false;
+    let mut parse_err = None;
+    let mut done = false;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline && !done {
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(Evt::RawArmed(hz)) => {
+                edges.tick_hz = hz;
+                armed = true;
+            }
+            Ok(Evt::RawData(reply)) => {
+                if let Err(e) = edges.push_reply(&reply) {
+                    parse_err.get_or_insert(e);
+                }
+            }
+            Ok(Evt::Status(_)) => done = true,
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(_) => break,
+        }
+    }
+
+    step("the edge list arms and reports its tick rate", armed,
+         &format!("tick_hz={}", edges.tick_hz));
+    step("edges arrive and parse as whole records",
+         parse_err.is_none() && edges.list.len() > 16,
+         &parse_err.clone().unwrap_or_else(|| format!("{} edges", edges.list.len())));
+
+    let monotonic = edges.list.windows(2).all(|w| w[1].tick >= w[0].tick);
+    step("ticks only go up, across replies and the 32-bit wrap", monotonic, "");
+
+    // Every tap has to move. A whole-capture "it saw transitions" was
+    // satisfied by one working channel out of two for several rounds on the
+    // firmware side, for exactly this reason.
+    let mut moved = [false; 2];
+    for w in edges.list.windows(2) {
+        for (ch, m) in moved.iter_mut().enumerate() {
+            let bit = 1u8 << ch;
+            if (w[0].lines ^ w[1].lines) & bit != 0 {
+                *m = true;
+            }
+        }
+    }
+    step("both taps move - clock and data", moved[0] && moved[1],
+         &format!("clk={} data={}", moved[0], moved[1]));
+
+    let (a, b) = edges.span_ticks();
+    let us = (b - a) as f64 / edges.tick_hz.max(1) as f64 * 1e6;
+    step("the captured window is a sensible length", us > 1.0 && us < 5e6,
+         &format!("{us:.1} us"));
 
     let _ = tx.send(Req::Quit);
     println!();

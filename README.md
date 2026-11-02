@@ -71,7 +71,8 @@ around, not a tab bolted onto something else.
 ```powershell
 cd gui
 cargo build --release
-targeteleaseusbridge-rt-gui.exe
+target
+eleaseusbridge-rt-gui.exe
 ```
 
 Five tabs, in the order the instrument is used - pick a board, set the capture
@@ -85,8 +86,21 @@ capture tabs are shown **disabled with the reason** rather than hidden, because
 a window that silently looks different on two boards teaches nobody why.
 
 ```powershell
-targeteleaseusbridge-rt-gui.exe --smoke 975a6193
+target
+eleaseusbridge-rt-gui.exe --smoke 975a6193
 ```
+
+The Capture tab draws a **live waveform** from the same capture, off the raw
+edge list. Two things about it are worth knowing before reading one:
+
+- In oversampled mode the axis is time, and the gap between two edges is a
+  measurement. In pin-clocked mode a tick **is a bus clock**, so the spacing
+  says what the bus did and not when - the panel labels the axis differently
+  and says so rather than leaving it to be inferred.
+- Pin-clocked capture skips the raw sample store while it decodes, which is
+  what bought it 6 to 8 MHz. The waveform and the decoder cannot both run in
+  that mode, so the checkbox refuses the combination instead of drawing an
+  empty trace that looks like a dead bus.
 
 `--smoke` drives the window's own code paths with no window at all: the real
 worker, the real configuration ordering, the real reply parsing, against real
