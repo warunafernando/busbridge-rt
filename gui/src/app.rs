@@ -60,6 +60,13 @@ pub struct App {
 
     log: Vec<(String, String)>,
     raw_entry: String,
+    /// Commands typed, newest last. A bench console without history is a
+    /// console where every repeated command is retyped, and the commands here
+    /// are long and exact - `SNIFF:CH i3c d8 d9` does not survive a typo.
+    history: Vec<String>,
+    /// Where the up-arrow has walked back to. None means "at the live entry".
+    hist_pos: Option<usize>,
+    log_errors_only: bool,
 
     runs: Vec<Run>,
     scripts_dir: String,
@@ -91,6 +98,9 @@ impl App {
             wave_err: None,
             log: Vec::new(),
             raw_entry: String::new(),
+            history: Vec::new(),
+            hist_pos: None,
+            log_errors_only: false,
             runs: Vec::new(),
             scripts_dir,
             cap_path: String::new(),
@@ -833,47 +843,157 @@ impl App {
     }
 
     fn console(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
+        ui.add_space(5.0);
         ui.horizontal(|ui| {
-            ui.label(RichText::new("\u{203a}").color(Palette::ACCENT).monospace().strong());
+            ui.label(
+                RichText::new("\u{203a}")
+                    .color(Palette::ACCENT)
+                    .monospace()
+                    .strong()
+                    .size(15.0),
+            );
             let r = ui.add(
                 egui::TextEdit::singleline(&mut self.raw_entry)
-                    .desired_width(ui.available_width() - 84.0)
+                    // Room for Send, the errors toggle, Clear and the two
+                    // counters. 250 was sized before the counters moved onto
+                    // this row and clipped Clear to a single letter.
+                    .desired_width((ui.available_width() - 380.0).max(160.0))
                     .font(egui::TextStyle::Monospace)
-                    .hint_text("SNIFF:STAT?"),
+                    // Plain words, not an arrow glyph: the default font has no
+                    // U+2191 and drew it as a replacement box, which reads
+                    // as a missing character rather than as a hint.
+                    .hint_text("SNIFF:STAT?    Up / Down for history"),
             );
+
+            // History on the arrows, and only while the field has focus - the
+            // same keys scroll the transcript otherwise.
+            //
+            // The keys are consumed explicitly. A singleline TextEdit ignores
+            // up and down, but it does not swallow them, so without this the
+            // scroll area underneath moved at the same time and the window
+            // appeared to jump every time someone walked back a command.
+            if r.has_focus() && !self.history.is_empty() {
+                let (up, down) = ui.input_mut(|i| {
+                    (
+                        i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                        i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                    )
+                });
+                if up {
+                    let next = match self.hist_pos {
+                        None => self.history.len() - 1,
+                        Some(0) => 0,
+                        Some(n) => n - 1,
+                    };
+                    self.hist_pos = Some(next);
+                    self.raw_entry = self.history[next].clone();
+                }
+                if down {
+                    match self.hist_pos {
+                        Some(n) if n + 1 < self.history.len() => {
+                            self.hist_pos = Some(n + 1);
+                            self.raw_entry = self.history[n + 1].clone();
+                        }
+                        Some(_) => {
+                            // Past the newest entry is the empty line being
+                            // typed, not the oldest one wrapped around.
+                            self.hist_pos = None;
+                            self.raw_entry.clear();
+                        }
+                        None => {}
+                    }
+                }
+            }
+
             let send = (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
                 || ui.button("Send").clicked();
-            if send && !self.raw_entry.trim().is_empty() {
-                self.send(Req::Raw(self.raw_entry.trim().to_string()));
-                self.raw_entry.clear();
+            if send {
+                let line = self.raw_entry.trim().to_string();
+                if !line.is_empty() {
+                    // Not recorded twice in a row. Pressing enter on the same
+                    // command four times should leave one entry to walk back
+                    // to, not four.
+                    if self.history.last().map(String::as_str) != Some(line.as_str()) {
+                        self.history.push(line.clone());
+                    }
+                    self.hist_pos = None;
+                    self.send(Req::Raw(line));
+                    self.raw_entry.clear();
+                }
                 r.request_focus();
             }
-        });
-        ui.add_space(4.0);
-        egui::ScrollArea::vertical()
-            .id_salt("log")
-            .stick_to_bottom(true)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for (cmd, reply) in &self.log {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        ui.label(RichText::new("\u{203a}").color(Palette::FAINT).monospace());
-                        ui.label(RichText::new(cmd).monospace().color(Palette::DIM));
-                    });
-                    let c = if reply.starts_with("ERR") {
-                        Palette::BAD
-                    } else {
-                        Palette::TEXT
-                    };
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new(reply).monospace().color(c));
-                    });
-                }
-            });
-    }
 
+            ui.checkbox(&mut self.log_errors_only, "errors")
+                .on_hover_text("Show only the commands that were refused.");
+            if ui.button("Clear").clicked() {
+                self.log.clear();
+            }
+            // Counts on this row, not under the transcript. Anything placed
+            // after a scroll area that does not shrink makes the panel ask for
+            // more height than it has, and a resizable bottom panel answers
+            // that by growing until it has eaten the window - which is exactly
+            // what it did.
+            let errs = self.log.iter().filter(|(_, r)| r.starts_with("ERR")).count();
+            style::right(ui, |ui| {
+                if errs > 0 {
+                    style::chip(ui, "errors", &errs.to_string(), Palette::BAD);
+                }
+                style::chip(ui, "lines", &self.log.len().to_string(), Palette::DIM);
+            });
+        });
+        ui.add_space(5.0);
+
+        // Whatever the panel has left, and no more.
+        let room = (ui.available_height() - 8.0).max(32.0);
+        egui::Frame::new()
+            .fill(Palette::PLOT_BG)
+            .corner_radius(egui::CornerRadius::same(5))
+            .inner_margin(egui::Margin::same(8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                egui::ScrollArea::vertical()
+                    .id_salt("log")
+                    .stick_to_bottom(true)
+                    .max_height(room - 18.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if self.log.is_empty() {
+                            ui.label(
+                                RichText::new("nothing sent yet")
+                                    .color(Palette::FAINT)
+                                    .small(),
+                            );
+                        }
+                        for (cmd, reply) in &self.log {
+                            let bad = reply.starts_with("ERR");
+                            if self.log_errors_only && !bad {
+                                continue;
+                            }
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                ui.label(
+                                    RichText::new("\u{203a}")
+                                        .color(Palette::FAINT)
+                                        .monospace(),
+                                );
+                                ui.label(
+                                    RichText::new(cmd).monospace().color(Palette::DIM),
+                                );
+                            });
+                            // The reply indented under its command, so a long
+                            // one does not read as the next command.
+                            ui.horizontal_wrapped(|ui| {
+                                ui.add_space(14.0);
+                                ui.label(RichText::new(reply).monospace().color(
+                                    if bad { Palette::BAD } else { Palette::TEXT },
+                                ));
+                            });
+                            ui.add_space(2.0);
+                        }
+                    });
+            });
+        ui.add_space(3.0);
+    }
 }
 
 /// What colour a token is, in one place.
