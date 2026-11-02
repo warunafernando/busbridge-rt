@@ -18,6 +18,7 @@ use egui::{Color32, RichText};
 
 use crate::device::{self, Board, Mark};
 use crate::runner::Run;
+use crate::style::{self, Palette};
 use crate::wave::{self, Edges, View};
 use crate::worker::{self, CaptureCfg, Evt, Req};
 
@@ -204,6 +205,7 @@ impl eframe::App for App {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(400));
         }
 
+        style::install(ui.ctx());
         egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
         if let Some(e) = self.err.clone() {
             egui::Panel::top("err").show(ui, |ui| {
@@ -232,27 +234,15 @@ impl eframe::App for App {
 
 impl App {
     fn top_bar(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(3.0);
         ui.horizontal(|ui| {
-            ui.heading("BUSBRIDGE-RT");
-            ui.separator();
-            match &self.connected {
-                Some((serial, board, _)) => {
-                    let c = if board.has_capture_engine() {
-                        Color32::from_rgb(120, 200, 120)
-                    } else {
-                        Color32::from_rgb(220, 180, 90)
-                    };
-                    ui.label(RichText::new(board.label()).color(c));
-                    ui.label(RichText::new(&serial[..8.min(serial.len())]).weak());
-                    if ui.button("Disconnect").clicked() {
-                        self.send(Req::Disconnect);
-                    }
-                }
-                None => {
-                    ui.label(RichText::new("not connected").weak());
-                }
-            }
-            ui.separator();
+            ui.label(RichText::new("BUSBRIDGE").color(Palette::ACCENT).strong().size(16.0));
+            ui.label(RichText::new("RT").color(Palette::DIM).size(16.0));
+            ui.add_space(8.0);
+
+            // Tabs first and at fixed positions. They are the only thing in
+            // this bar whose place must not depend on how long the board name
+            // happens to be.
             for (t, name) in [
                 (Tab::Board, "Board"),
                 (Tab::Capture, "Capture"),
@@ -260,11 +250,38 @@ impl App {
                 (Tab::Files, "Files"),
                 (Tab::Bench, "Bench"),
             ] {
-                if ui.selectable_label(self.tab == t, name).clicked() {
+                let on = self.tab == t;
+                let text = if on {
+                    RichText::new(name).color(Color32::BLACK).strong()
+                } else {
+                    RichText::new(name).color(Palette::DIM)
+                };
+                let fill = if on { Palette::ACCENT } else { Color32::TRANSPARENT };
+                if ui.add(egui::Button::new(text).fill(fill)).clicked() {
                     self.tab = t;
                 }
             }
+
+            // Connection state at the right-hand end, where it can change
+            // width without moving anything.
+            style::right(ui, |ui| {
+                match self.connected.clone() {
+                    Some((serial, board, _)) => {
+                        if ui.button("Disconnect").clicked() {
+                            self.send(Req::Disconnect);
+                        }
+                        let c = if board.has_capture_engine() {
+                            Palette::GOOD
+                        } else {
+                            Palette::WARN
+                        };
+                        style::chip(ui, board.label(), &serial[..8.min(serial.len())], c);
+                    }
+                    None => style::chip(ui, "board", "not connected", Palette::FAINT),
+                }
+            });
         });
+        ui.add_space(3.0);
     }
 
     fn tab_board(&mut self, ui: &mut egui::Ui) {
@@ -327,237 +344,230 @@ impl App {
 
     fn tab_capture(&mut self, ui: &mut egui::Ui) {
         let rt = self.is_rt();
-        ui.heading("Capture");
         if !rt {
-            ui.label(
-                RichText::new("Needs the RT1186's capture engine.")
-                    .color(Color32::from_rgb(220, 180, 90)),
-            );
+            style::card(ui, "", |ui| {
+                style::note(ui, Palette::WARN,
+                    "This board has no CM7 capture engine. The controls below are the RT1186's; the console still works.");
+            });
+            ui.add_space(8.0);
         }
-        ui.add_space(4.0);
 
         ui.add_enabled_ui(rt, |ui| {
-            egui::Grid::new("cfg").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                ui.label("Protocol");
-                ui.horizontal(|ui| {
-                    for p in ["i2c", "i3c", "spi", "mdio", "uart"] {
-                        if ui.selectable_label(self.cfg.proto == p, p).clicked() {
-                            self.cfg.proto = p.into();
-                            // The default tap pair differs per protocol, and a
-                            // stale pair is worse than none: tap 0 must be the
-                            // clock for a pin-clocked capture, and the wrong
-                            // pair decodes to nothing with no error.
-                            self.cfg.taps = match p {
-                                "i3c" => "d8 d9".into(),
-                                _ => "d4 d5".into(),
-                            };
-                        }
+            style::card(ui, "capture", |ui| {
+                style::row(ui, "Protocol", |ui| {
+                    let mut p = self.cfg.proto.clone();
+                    if style::segmented(ui, &mut p, &[
+                        ("i2c", "Two wires, ack on the ninth bit."),
+                        ("i3c", "Two wires, T-bit on the ninth - parity on a write, end-of-data on a read."),
+                        ("spi", "Four wires."),
+                        ("mdio", "Clause 22 and clause 45."),
+                        ("uart", "Asynchronous, no clock to tap."),
+                    ]) {
+                        // The default tap pair differs per protocol, and a stale
+                        // pair is worse than none: tap 0 must be the clock for a
+                        // pin-clocked capture, and the wrong pair decodes to
+                        // nothing with no error.
+                        self.cfg.taps = if p == "i3c" { "d8 d9".into() } else { "d4 d5".into() };
+                        self.cfg.proto = p;
                     }
                 });
-                ui.end_row();
-
-                ui.label("Taps");
-                ui.add(egui::TextEdit::singleline(&mut self.cfg.taps).desired_width(140.0))
-                    .on_hover_text("Tap 0 is the clock. SNIFF:TAPS? lists what this board has spare.");
-                ui.end_row();
-
-                ui.label("Mode");
-                ui.horizontal(|ui| {
-                    for (m, hint) in [
+                style::row(ui, "Taps", |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.cfg.taps)
+                        .desired_width(130.0)
+                        .font(egui::TextStyle::Monospace))
+                        .on_hover_text("Tap 0 is the clock. SNIFF:TAPS? lists what this board has spare.");
+                });
+                style::row(ui, "Mode", |ui| {
+                    let mut m = self.cfg.mode.clone();
+                    if style::segmented(ui, &mut m, &[
                         ("pinclock", "Shifted by the bus's own clock: one sample per bit, exact to 12.5 MHz. No framing, and the last frame of a window loses its tail."),
                         ("oversample", "Free-running sample clock: sees framing, idle and glitches, but needs about four samples a bit so it follows a bus only to ~3 MHz."),
-                    ] {
-                        if ui.selectable_label(self.cfg.mode == m, m).on_hover_text(hint).clicked() {
-                            self.cfg.mode = m.into();
-                        }
+                    ]) {
+                        self.cfg.mode = m;
                     }
                 });
-                ui.end_row();
-
-                ui.label("Bus rate");
-                ui.horizontal(|ui| {
-                    let mut hz = self.cfg.rate_hz as f64 / 1e6;
-                    if ui.add(egui::DragValue::new(&mut hz).speed(0.1).range(0.01..=15.0).suffix(" MHz")).changed() {
-                        self.cfg.rate_hz = (hz * 1e6) as u32;
+                style::row(ui, "Bus rate", |ui| {
+                    let mut mhz = self.cfg.rate_hz as f64 / 1e6;
+                    if ui.add(egui::DragValue::new(&mut mhz)
+                            .speed(0.05).range(0.01..=15.0).max_decimals(3).suffix(" MHz"))
+                        .changed()
+                    {
+                        self.cfg.rate_hz = (mhz * 1e6) as u32;
                     }
+                    ui.add_space(4.0);
                     for r in [1_000_000u32, 4_000_000, 8_000_000, 12_500_000] {
-                        if ui.small_button(format!("{}", r / 1_000_000)).clicked() {
+                        let on = self.cfg.rate_hz == r;
+                        let label = if r == 12_500_000 { "12.5".to_string() }
+                                    else { format!("{}", r / 1_000_000) };
+                        let t = if on { RichText::new(label).color(Color32::BLACK).strong() }
+                                else { RichText::new(label).color(Palette::DIM) };
+                        let fill = if on { Palette::ACCENT } else { Color32::TRANSPARENT };
+                        if ui.add(egui::Button::new(t).fill(fill)).clicked() {
                             self.cfg.rate_hz = r;
                         }
                     }
                 });
-                ui.end_row();
-
-                ui.label("Intake");
-                ui.horizontal(|ui| {
+                style::row(ui, "Intake", |ui| {
                     ui.checkbox(&mut self.cfg.dma, "eDMA")
                         .on_hover_text("Takes the pin-clocked intake off the CPU. Needed at 12.5 MHz; harmless below.");
                     ui.checkbox(&mut self.cfg.decode, "decode")
                         .on_hover_text("Off captures samples only - the measurement that says what capture costs without decode.");
                 });
-                ui.end_row();
             });
 
             ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                let dirty = self.pushed.as_ref() != Some(&self.cfg);
-                if ui.add_enabled(dirty, egui::Button::new("Apply")).clicked() {
-                    self.send(Req::Configure(self.cfg.clone()));
-                    self.pushed = Some(self.cfg.clone());
-                }
-                if dirty {
-                    ui.label(RichText::new("not pushed").weak());
-                }
-                ui.separator();
-                if ui.add_enabled(!self.running, egui::Button::new("Start")).clicked() {
-                    if self.pushed.as_ref() != Some(&self.cfg) {
+
+            style::card(ui, "run", |ui| {
+                ui.horizontal(|ui| {
+                    let dirty = self.pushed.as_ref() != Some(&self.cfg);
+                    let start = egui::Button::new(
+                        RichText::new("Start").color(Color32::BLACK).strong()
+                    ).fill(Palette::GOOD);
+                    if ui.add_enabled(!self.running, start).clicked() {
+                        if dirty {
+                            self.send(Req::Configure(self.cfg.clone()));
+                            self.pushed = Some(self.cfg.clone());
+                        }
+                        self.events.clear();
+                        self.send(Req::Clear);
+                        if self.wave_on {
+                            // SNIFF:RAW:START restarts the capture core itself,
+                            // so it stands in for SNIFF:START rather than
+                            // following it. Sending both would start the capture
+                            // twice and throw away the first.
+                            self.edges.clear();
+                            self.send(Req::RawStart(200_000));
+                        } else {
+                            self.send(Req::Start);
+                        }
+                        self.running = true;
+                    }
+                    if ui.add_enabled(self.running, egui::Button::new("Stop")).clicked() {
+                        self.send(Req::Stop);
+                        self.running = false;
+                    }
+                    if ui.button("Clear").clicked() {
+                        self.events.clear();
+                        self.edges.clear();
+                        self.send(Req::Clear);
+                    }
+                    if ui.button("Status").clicked() {
+                        self.send(Req::Status);
+                    }
+                    ui.separator();
+                    if ui.add_enabled(dirty, egui::Button::new("Apply"))
+                        .on_hover_text("Push the configuration without starting. Start applies it anyway.")
+                        .clicked()
+                    {
                         self.send(Req::Configure(self.cfg.clone()));
                         self.pushed = Some(self.cfg.clone());
                     }
-                    self.events.clear();
-                    self.send(Req::Clear);
-                    if self.wave_on {
-                        // SNIFF:RAW:START restarts the capture core itself, so
-                        // it stands in for SNIFF:START rather than following
-                        // it. Sending both would start the capture twice and
-                        // throw away the first.
-                        self.edges.clear();
-                        self.send(Req::RawStart(200_000));
-                    } else {
-                        self.send(Req::Start);
+
+                    // Pin-clocked capture skips the raw sample store while it
+                    // decodes - that is what bought 6 to 8 MHz - so asking for
+                    // both gets an empty trace rather than an error. Refusing the
+                    // combination is better than drawing nothing and letting it
+                    // look like a dead bus.
+                    let blocked = self.cfg.mode == "pinclock" && self.cfg.decode;
+                    let mut want = self.wave_on;
+                    let cb = ui.add_enabled(!blocked, egui::Checkbox::new(&mut want, "Waveform"));
+                    if blocked {
+                        cb.on_hover_text("Pin-clocked capture does not store raw samples while it decodes. Turn decode off for a waveform, or use oversampled mode to have both.");
+                    } else if want != self.wave_on {
+                        self.wave_on = want;
+                        if !want {
+                            self.send(Req::RawStop);
+                        } else if self.running {
+                            self.send(Req::RawStart(200_000));
+                        }
                     }
-                    self.running = true;
-                }
-                if ui.add_enabled(self.running, egui::Button::new("Stop")).clicked() {
-                    self.send(Req::Stop);
-                    self.running = false;
-                }
-                if ui.button("Clear").clicked() {
-                    self.events.clear();
-                    self.send(Req::Clear);
-                }
-                if ui.button("Status").clicked() {
-                    self.send(Req::Status);
-                }
-                ui.separator();
-                // Pin-clocked capture skips the raw sample store while it is
-                // decoding - that is what bought 6 to 8 MHz - so asking for
-                // both gets an empty trace rather than an error. Refusing the
-                // combination here is better than drawing nothing and letting
-                // it look like a dead bus.
-                let blocked = self.cfg.mode == "pinclock" && self.cfg.decode;
-                let mut want = self.wave_on;
-                let cb = ui.add_enabled(!blocked, egui::Checkbox::new(&mut want, "Waveform"));
-                if blocked {
-                    cb.on_hover_text(
-                        "Pin-clocked capture does not store raw samples while it                          decodes. Turn decode off for a waveform, or use                          oversampled mode to have both.",
-                    );
-                } else if want != self.wave_on {
-                    self.wave_on = want;
-                    if !want {
-                        self.send(Req::RawStop);
-                    } else if self.running {
-                        self.send(Req::RawStart(200_000));
-                    }
-                }
+
+                    // Everything that changes width lives at the right-hand end.
+                    // A readout that grows must never move a button.
+                    style::right(ui, |ui| {
+                        if self.running {
+                            style::chip(ui, "state", "running", Palette::GOOD);
+                        } else {
+                            style::chip(ui, "state", "stopped", Palette::FAINT);
+                        }
+                        if dirty {
+                            style::chip(ui, "config", "not pushed", Palette::WARN);
+                        }
+                    });
+                });
             });
         });
 
-        ui.add_space(6.0);
-        if !self.status.is_empty() {
-            ui.label(RichText::new(&self.status).monospace().weak());
-        }
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("{} events", self.events.len())).strong());
-            if self.cfg.proto == "i3c" {
-                ui.label(
-                    RichText::new(
-                        "I3C: the ninth bit is a T-bit driven by the transmitter, \
-                         not an acknowledge.",
-                    )
-                    .weak(),
-                );
-            }
-        });
+        ui.add_space(8.0);
+
         if self.wave_on {
-            ui.add_space(4.0);
-            let names: Vec<String> = self
-                .cfg
-                .taps
-                .split_whitespace()
-                .enumerate()
-                .map(|(i, t)| {
+            style::card(ui, "waveform", |ui| {
+                let names: Vec<String> = self.cfg.taps.split_whitespace().enumerate()
                     // Tap 0 is the clock by the firmware's own rule, and the
                     // label says so: a two-line trace with no clock named is a
                     // guess the reader should not have to make.
-                    if i == 0 {
-                        format!("{t}  clk")
-                    } else {
-                        t.to_string()
+                    .map(|(i, t)| if i == 0 { format!("{t} clk") } else { t.to_string() })
+                    .collect();
+
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.view.follow, "follow")
+                        .on_hover_text("Keep the right edge pinned to the newest sample.");
+                    if ui.button("fit")
+                        .on_hover_text("Fit the most recent burst. An idle bus is most of what an oversampled window holds, and the thing you want is usually what just happened.")
+                        .clicked()
+                    {
+                        let (a, b) = self.edges.last_burst();
+                        if b > a {
+                            self.view.left = a as f64;
+                            self.view.width = (b - a) as f64;
+                            self.view.follow = false;
+                        }
                     }
-                })
-                .collect();
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(format!("{} edges", self.edges.list.len())).strong(),
-                );
-                {
-                    // Both spans, side by side. "fit" fits the second, and the
-                    // difference between them is the idle the capture sat
-                    // through - which on an oversampled window is most of it.
-                    let (f0, f1) = self.edges.span_ticks();
-                    let (a0, a1) = self.edges.last_burst();
-                    let hz = self.edges.tick_hz.max(1) as f64;
-                    ui.label(
-                        RichText::new(format!(
-                            "full {:.2} ms / last burst {:.3} ms",
-                            (f1 - f0) as f64 / hz * 1e3,
-                            (a1 - a0) as f64 / hz * 1e3
-                        ))
-                        .weak()
-                        .small(),
-                    );
-                }
-                ui.checkbox(&mut self.view.follow, "follow")
-                    .on_hover_text("Keep the right edge pinned to the newest sample.");
-                if ui
-                    .small_button("fit")
-                    .on_hover_text(
-                        "Fit the most recent burst. An idle bus is most of what                          an oversampled window holds, and the thing you want                          is usually what just happened.",
-                    )
-                    .clicked()
-                {
-                    let (a, b) = self.edges.last_burst();
-                    if b > a {
-                        self.view.left = a as f64;
-                        self.view.width = (b - a) as f64;
-                        self.view.follow = false;
+                    if ui.button("all").on_hover_text("The whole captured span.").clicked() {
+                        let (a, b) = self.edges.span_ticks();
+                        if b > a {
+                            self.view.left = a as f64;
+                            self.view.width = (b - a) as f64;
+                            self.view.follow = false;
+                        }
                     }
-                }
-                if self.cfg.mode == "pinclock" {
-                    ui.label(
-                        RichText::new(
-                            "pin-clocked: the axis is bus clocks, not time",
-                        )
-                        .color(Color32::from_rgb(220, 180, 90))
-                        .small(),
-                    );
-                }
-                if let Some(e) = &self.wave_err {
-                    ui.label(RichText::new(e).color(Color32::from_rgb(220, 90, 90)).small());
-                }
+
+                    style::right(ui, |ui| {
+                        let hz = self.edges.tick_hz.max(1) as f64;
+                        let (f0, f1) = self.edges.span_ticks();
+                        let (a0, a1) = self.edges.last_burst();
+                        if let Some(e) = self.wave_err.clone() {
+                            style::chip(ui, "error", &e, Palette::BAD);
+                        }
+                        style::chip(ui, "burst", &secs((a1 - a0) as f64 / hz), Palette::TEXT);
+                        style::chip(ui, "captured", &secs((f1 - f0) as f64 / hz), Palette::DIM);
+                        style::chip(ui, "edges", &self.edges.list.len().to_string(), Palette::DATA);
+                    });
+                });
+                ui.add_space(4.0);
+                wave::draw(ui, &self.edges, &mut self.view, &names,
+                           self.cfg.mode == "pinclock");
             });
-            wave::draw(
-                ui,
-                &self.edges,
-                &mut self.view,
-                &names,
-                self.cfg.mode == "pinclock",
-            );
-            ui.add_space(4.0);
+            ui.add_space(8.0);
         }
-        events_view(ui, &self.events);
+
+        style::card(ui, "events", |ui| {
+            ui.horizontal(|ui| {
+                if self.cfg.proto == "i3c" {
+                    style::note(ui, Palette::DIM,
+                        "I3C: the ninth bit is a T-bit driven by the transmitter, not an acknowledge.");
+                }
+                style::right(ui, |ui| {
+                    style::chip(ui, "events", &self.events.len().to_string(), Palette::DATA);
+                });
+            });
+            ui.add_space(4.0);
+            events_view(ui, &self.events);
+            if !self.status.is_empty() {
+                ui.add_space(4.0);
+                ui.label(RichText::new(&self.status).monospace().color(Palette::FAINT).small());
+            }
+        });
     }
 
     fn tab_trace(&mut self, ui: &mut egui::Ui) {
@@ -829,6 +839,23 @@ impl App {
                     });
                 }
             });
+    }
+}
+
+/// A duration in seconds, printed at the scale it deserves.
+///
+/// One formatter rather than a hardcoded `ms` everywhere: a capture window
+/// here runs from tens of nanoseconds to minutes, and "0.00008 ms" is a number
+/// nobody reads correctly at a glance.
+fn secs(t: f64) -> String {
+    if t < 1e-6 {
+        format!("{:.0} ns", t * 1e9)
+    } else if t < 1e-3 {
+        format!("{:.2} us", t * 1e6)
+    } else if t < 1.0 {
+        format!("{:.2} ms", t * 1e3)
+    } else {
+        format!("{t:.2} s")
     }
 }
 

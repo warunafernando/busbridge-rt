@@ -22,7 +22,7 @@
 //! capture panel refuses that combination instead of drawing nothing.
 
 use eframe::egui;
-use egui::{Color32, Rect, Sense, Stroke, Vec2};
+use egui::{Color32, Sense, Stroke, Vec2};
 
 /// One transition: the tick it happened at, and every line's level after it.
 #[derive(Clone, Copy)]
@@ -189,21 +189,60 @@ impl Default for View {
     }
 }
 
-const ROW_H: f32 = 44.0;
-const PAD: f32 = 10.0;
+const ROW_H: f32 = 46.0;
+const PAD: f32 = 12.0;
+const RULER_H: f32 = 20.0;
 
-/// Draw the lines, and handle pan and zoom.
+/// A tick step that lands on a round number.
+///
+/// 1, 2 or 5 times a power of ten - the spacings a person reads without having
+/// to divide. Chosen from the span rather than fixed, so the same ruler works
+/// across the six orders of magnitude between a 12.5 MHz bit and an idle
+/// second.
+fn nice_step(span: f64, want: f64) -> f64 {
+    if span <= 0.0 {
+        return 1.0;
+    }
+    let raw = span / want.max(1.0);
+    let mag = 10f64.powf(raw.log10().floor());
+    let n = raw / mag;
+    mag * if n < 1.5 {
+        1.0
+    } else if n < 3.5 {
+        2.0
+    } else if n < 7.5 {
+        5.0
+    } else {
+        10.0
+    }
+}
+
+/// A time offset, at the scale the span deserves.
+fn tick_label(t: f64, step: f64) -> String {
+    let a = t.abs();
+    if step >= 1e-3 {
+        format!("{:.*} ms", if step >= 1e-2 { 0 } else { 1 }, t * 1e3)
+    } else if step >= 1e-6 {
+        format!("{:.*} us", if step >= 1e-5 { 0 } else { 1 }, t * 1e6)
+    } else if a < 1.0 {
+        format!("{:.0} ns", t * 1e9)
+    } else {
+        format!("{t:.0} s")
+    }
+}
+
+/// Draw the lines, the ruler, and handle pan and zoom.
 ///
 /// `names` is in tap order, which is the order the firmware was told to bind
 /// them - so index 0 is the clock, and that is why it is drawn first and
 /// labelled rather than coloured the same as the rest.
 pub fn draw(ui: &mut egui::Ui, edges: &Edges, view: &mut View, names: &[String], pinclock: bool) {
     let n = names.len().max(1);
-    let h = ROW_H * n as f32 + PAD * 2.0 + 18.0;
+    let h = ROW_H * n as f32 + PAD * 2.0 + RULER_H;
     let (resp, painter) =
         ui.allocate_painter(Vec2::new(ui.available_width(), h), Sense::click_and_drag());
     let rect = resp.rect;
-    painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
+    painter.rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
 
     if edges.list.len() < 2 {
         painter.text(
@@ -247,29 +286,90 @@ pub fn draw(ui: &mut egui::Ui, edges: &Edges, view: &mut View, names: &[String],
     let tw = view.width.max(1.0);
     let x_of = |tick: f64| rect.left() + ((tick - t0) / tw) as f32 * rect.width();
 
-    let grid = Stroke::new(1.0, ui.visuals().weak_text_color().gamma_multiply(0.25));
-    let clock_c = Color32::from_rgb(120, 190, 240);
-    let data_c = Color32::from_rgb(140, 220, 160);
+    let plot_bottom = rect.bottom() - RULER_H;
+    let grid_c = Color32::from_rgb(0x20, 0x29, 0x32);
+    let clock_c = Color32::from_rgb(0x6F, 0xB6, 0xD8);
+    let data_c = Color32::from_rgb(0x8F, 0xE3, 0xB0);
+    let dim = Color32::from_rgb(0x5A, 0x68, 0x76);
 
+    // ---- grid and ruler ---------------------------------------------------
+    //
+    // In pin-clocked mode a tick is a bus clock, not a unit of time, so the
+    // ruler counts clocks. Printing microseconds there would be a plausible
+    // wrong answer: the numbers would look like time and would not be.
+    let hz = edges.tick_hz.max(1) as f64;
+    let (span_u, unit_per_tick) = if pinclock {
+        (tw, 1.0)
+    } else {
+        (tw / hz, 1.0 / hz)
+    };
+    let step_u = nice_step(span_u, 7.0);
+    let step_ticks = step_u / unit_per_tick;
+    // Labels relative to the left edge of the view, not to the capture.
+    //
+    // Absolute offsets from the first edge read 1620600 us, 1620620 us - seven
+    // digits where two carry meaning, and the eye has to subtract two of them
+    // to get the thing it wanted. A view-relative ruler is what a scope shows
+    // and what a person is already reading when they zoom in on a frame.
+    if step_ticks.is_finite() && step_ticks > 0.0 {
+        let base = t0;
+        let mut k = ((t0 - base) / step_ticks).floor();
+        for _ in 0..40 {
+            let tick = base + k * step_ticks;
+            k += 1.0;
+            if tick < t0 {
+                continue;
+            }
+            if tick > t0 + tw {
+                break;
+            }
+            let x = x_of(tick);
+            painter.line_segment(
+                [
+                    egui::pos2(x, rect.top() + PAD * 0.5),
+                    egui::pos2(x, plot_bottom),
+                ],
+                Stroke::new(1.0, grid_c),
+            );
+            let off = (tick - base) * unit_per_tick;
+            let label = if pinclock {
+                format!("{off:.0}")
+            } else {
+                tick_label(off, step_u)
+            };
+            painter.text(
+                egui::pos2(x + 3.0, plot_bottom + 3.0),
+                egui::Align2::LEFT_TOP,
+                label,
+                egui::FontId::monospace(10.0),
+                dim,
+            );
+        }
+    }
+    painter.line_segment(
+        [
+            egui::pos2(rect.left(), plot_bottom),
+            egui::pos2(rect.right(), plot_bottom),
+        ],
+        Stroke::new(1.0, grid_c),
+    );
+
+    // ---- the traces -------------------------------------------------------
     for (ch, name) in names.iter().enumerate() {
         let top = rect.top() + PAD + ROW_H * ch as f32;
-        let lo = top + ROW_H - 14.0;
-        let hi = top + 6.0;
-        painter.line_segment(
-            [egui::pos2(rect.left(), lo), egui::pos2(rect.right(), lo)],
-            grid,
-        );
+        let lo = top + ROW_H - 18.0;
+        let hi = top + 4.0;
+        let colour = if ch == 0 { clock_c } else { data_c };
+        let stroke = Stroke::new(1.5, colour);
+        let bit = 1u8 << ch;
+
         painter.text(
-            egui::pos2(rect.left() + 4.0, top),
+            egui::pos2(rect.left() + 7.0, top - 2.0),
             egui::Align2::LEFT_TOP,
             name,
-            egui::FontId::monospace(11.0),
-            if ch == 0 { clock_c } else { data_c },
+            egui::FontId::monospace(10.5),
+            colour.gamma_multiply(0.85),
         );
-
-        let colour = if ch == 0 { clock_c } else { data_c };
-        let stroke = Stroke::new(1.4, colour);
-        let bit = 1u8 << ch;
 
         // Walk only the edges inside the view, plus the one before it - which
         // is what says where the line was when the window opens. Without it a
@@ -289,10 +389,7 @@ pub fn draw(ui: &mut egui::Ui, edges: &Edges, view: &mut View, names: &[String],
             }
             let y = if e.lines & bit != 0 { hi } else { lo };
             let xc = x.clamp(rect.left(), rect.right());
-            painter.line_segment(
-                [egui::pos2(prev_x, prev_y), egui::pos2(xc, prev_y)],
-                stroke,
-            );
+            painter.line_segment([egui::pos2(prev_x, prev_y), egui::pos2(xc, prev_y)], stroke);
             if (y - prev_y).abs() > 0.5 {
                 painter.line_segment([egui::pos2(xc, prev_y), egui::pos2(xc, y)], stroke);
             }
@@ -305,23 +402,33 @@ pub fn draw(ui: &mut egui::Ui, edges: &Edges, view: &mut View, names: &[String],
         );
     }
 
-    // The axis, and what it means - which is not the same in both modes.
-    let hz = edges.tick_hz.max(1) as f64;
-    let label = if pinclock {
-        format!("{:.0} bus clocks across", tw)
-    } else {
-        let us = tw / hz * 1e6;
-        if us >= 1000.0 {
-            format!("{:.2} ms across", us / 1000.0)
+    // ---- cursor -----------------------------------------------------------
+    //
+    // Where the pointer is, in the same units the ruler uses. A waveform you
+    // cannot take a reading off is a picture of a waveform.
+    if let Some(p) = resp.hover_pos() {
+        let x = p.x.clamp(rect.left(), rect.right());
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, plot_bottom)],
+            Stroke::new(1.0, Color32::from_rgb(0xE0, 0xB1, 0x5C).gamma_multiply(0.7)),
+        );
+        let tick = t0 + (x - rect.left()) as f64 / rect.width() as f64 * tw;
+        let off = (tick - t0) * unit_per_tick;
+        let txt = if pinclock {
+            format!("{off:.0} clk")
         } else {
-            format!("{us:.2} us across")
-        }
-    };
-    painter.text(
-        egui::pos2(rect.right() - 6.0, rect.bottom() - 4.0),
-        egui::Align2::RIGHT_BOTTOM,
-        label,
-        egui::FontId::monospace(11.0),
-        ui.visuals().weak_text_color(),
-    );
+            tick_label(off, step_u.min(off.abs().max(1e-9)))
+        };
+        painter.text(
+            egui::pos2(x + 4.0, rect.top() + 2.0),
+            egui::Align2::LEFT_TOP,
+            txt,
+            egui::FontId::monospace(10.5),
+            Color32::from_rgb(0xE0, 0xB1, 0x5C),
+        );
+    }
+
+    // No "N us across" footer. The ruler carries the scale now, and the
+    // footer sat on top of the right-hand tick label - two numbers in the same
+    // place, one of them wrong about what it measured.
 }

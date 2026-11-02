@@ -17,6 +17,7 @@ mod device;
 mod ffi;
 mod runner;
 mod smoke;
+mod style;
 mod wave;
 mod worker;
 
