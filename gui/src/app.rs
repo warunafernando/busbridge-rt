@@ -502,10 +502,33 @@ impl App {
                 ui.label(
                     RichText::new(format!("{} edges", self.edges.list.len())).strong(),
                 );
+                {
+                    // Both spans, side by side. "fit" fits the second, and the
+                    // difference between them is the idle the capture sat
+                    // through - which on an oversampled window is most of it.
+                    let (f0, f1) = self.edges.span_ticks();
+                    let (a0, a1) = self.edges.last_burst();
+                    let hz = self.edges.tick_hz.max(1) as f64;
+                    ui.label(
+                        RichText::new(format!(
+                            "full {:.2} ms / last burst {:.3} ms",
+                            (f1 - f0) as f64 / hz * 1e3,
+                            (a1 - a0) as f64 / hz * 1e3
+                        ))
+                        .weak()
+                        .small(),
+                    );
+                }
                 ui.checkbox(&mut self.view.follow, "follow")
                     .on_hover_text("Keep the right edge pinned to the newest sample.");
-                if ui.small_button("fit").clicked() {
-                    let (a, b) = self.edges.span_ticks();
+                if ui
+                    .small_button("fit")
+                    .on_hover_text(
+                        "Fit the most recent burst. An idle bus is most of what                          an oversampled window holds, and the thing you want                          is usually what just happened.",
+                    )
+                    .clicked()
+                {
+                    let (a, b) = self.edges.last_burst();
                     if b > a {
                         self.view.left = a as f64;
                         self.view.width = (b - a) as f64;

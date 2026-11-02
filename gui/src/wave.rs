@@ -115,6 +115,58 @@ impl Edges {
             _ => (0, 0),
         }
     }
+
+    /// The most recent burst of activity, which is what "fit" should show.
+    ///
+    /// Fitting the captured span was the obvious thing and it is the wrong
+    /// thing. An oversampled capture of a real bus is mostly idle: driving two
+    /// transfers by hand put 1.6 seconds between them, so the whole span was
+    /// 1640 ms with every transition inside two slivers at the ends. Correct,
+    /// and useless.
+    ///
+    /// Trimming leading and trailing silence does not help either, because
+    /// there was none to trim - the idle was in the MIDDLE, between two real
+    /// frames, and cutting that would hide one of them. What a person wants on
+    /// a live capture is the thing that just happened, so this walks back from
+    /// the newest edge while the gaps stay small and stops at the first real
+    /// silence.
+    ///
+    /// The threshold is relative - twenty times the median gap - rather than
+    /// an absolute time, so the same capture fits the same way at 1 MHz and at
+    /// 12.5 MHz.
+    pub fn last_burst(&self) -> (u64, u64) {
+        if self.list.len() < 3 {
+            return self.span_ticks();
+        }
+        let mut gaps: Vec<u64> = self
+            .list
+            .windows(2)
+            .map(|w| w[1].tick.saturating_sub(w[0].tick))
+            .collect();
+        gaps.sort_unstable();
+        let median = gaps[gaps.len() / 2].max(1);
+        let idle = median.saturating_mul(20).max(4);
+
+        let hi = self.list.len() - 1;
+        let mut lo = hi;
+        while lo > 0 && self.list[lo].tick.saturating_sub(self.list[lo - 1].tick) <= idle {
+            lo -= 1;
+        }
+        if hi == lo {
+            return self.span_ticks();
+        }
+        let width = self.list[hi].tick - self.list[lo].tick;
+        // A little air either side so the first and last transition are not
+        // drawn on the frame - and clamped, because padding that pushed the
+        // fitted window past the captured one reported `active 1804 ms` for a
+        // capture 1640 ms long, which is a number that cannot be true.
+        let pad = (width / 20 + 1).min(width.max(1));
+        let (f0, f1) = self.span_ticks();
+        (
+            self.list[lo].tick.saturating_sub(pad).max(f0),
+            (self.list[hi].tick + pad).min(f1.max(self.list[hi].tick)),
+        )
+    }
 }
 
 /// What part of the capture is on screen.
