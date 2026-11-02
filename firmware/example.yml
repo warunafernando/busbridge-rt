@@ -1,0 +1,14 @@
+busbridge_rt:
+  section-type: application
+  contents:
+    meta_path: examples/demo_apps/hello_world
+    document:
+      name: busbridge_rt
+      category: demo_apps
+      brief: BUSBRIDGE-RT - USB multi-protocol bus controller and sniffer.
+  boards:
+    frdmimxrt1186@cm33:
+    - +armgcc@debug
+    - +armgcc@flexspi_nor_debug
+    frdmimxrt1186@cm7:
+    - +armgcc@debug
