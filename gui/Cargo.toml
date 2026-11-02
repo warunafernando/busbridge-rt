@@ -1,0 +1,26 @@
+[package]
+name = "busbridge-rt-gui"
+version = "0.1.0"
+edition = "2021"
+description = "Bench console for BUSBRIDGE-RT: the RT1186 capture engine, first class"
+license = "MIT"
+build = "build.rs"
+
+[[bin]]
+name = "busbridge-rt-gui"
+path = "src/main.rs"
+
+[dependencies]
+# Matched to the bench console next door rather than chosen afresh. Both talk
+# to the same boards through the same C library and draw the same kind of
+# waveform, and two egui versions in one workspace means two sets of rendering
+# quirks to learn.
+eframe = { version = "0.36", default-features = false, features = [
+    "default_fonts",
+    "glow",          # OpenGL: works on any Windows 10/11 machine, no DX feature test
+] }
+egui = "0.36"
+
+[profile.release]
+opt-level = "s"
+lto = true

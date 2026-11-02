@@ -63,6 +63,41 @@ file reconstructed from pin-clocked data carries `Timing::Synthetic` and warns
 at every exit, because that mode records no transition times and the timing in
 such a file is invented.
 
+## The bench console
+
+`gui/` is a window for this board: the capture engine is what it is built
+around, not a tab bolted onto something else.
+
+```powershell
+cd gui
+cargo build --release
+targeteleaseusbridge-rt-gui.exe
+```
+
+Five tabs, in the order the instrument is used - pick a board, set the capture
+up and run it, look at where the records came from, write or open a file, run
+the bench measurements - with a console underneath all of them, because every
+control is a command line and hiding that from someone debugging their own
+firmware helps nobody.
+
+It talks to both boards. An STM32H5 answers everything in the console; the
+capture tabs are shown **disabled with the reason** rather than hidden, because
+a window that silently looks different on two boards teaches nobody why.
+
+```powershell
+targeteleaseusbridge-rt-gui.exe --smoke 975a6193
+```
+
+`--smoke` drives the window's own code paths with no window at all: the real
+worker, the real configuration ordering, the real reply parsing, against real
+hardware. A GUI is the one part of this project nothing else can check - the
+firmware has `acceptance.py`, the host library has `unit_test.c`, the analyser
+has its golden corpus, and a window has a person clicking, which is not a test
+and does not run twice the same way. It needs both boards, as the suite does.
+
+It links the host C library statically from the STM32H5 tree; point
+`BUSBRIDGE_LIB_DIR` elsewhere for a checkout somewhere else.
+
 ## Building and running
 
 Windows, PowerShell, with the MCUXpresso SDK and an arm-none-eabi toolchain.

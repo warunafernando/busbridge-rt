@@ -21,3 +21,6 @@ __pycache__/
 # its own first line says "do not edit" - so it is build output that happens
 # to be a .c file, not source.
 firmware/generated/
+
+# The GUI's cargo build tree. Reproducible, and large.
+gui/target/
