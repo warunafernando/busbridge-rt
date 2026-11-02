@@ -69,14 +69,23 @@ pub struct App {
     log_errors_only: bool,
 
     runs: Vec<Run>,
+    /// The board this window was on before it handed it to a script, so it can
+    /// take it back when the script is done.
+    resume: Option<String>,
+    last_resume: std::time::Instant,
     scripts_dir: String,
     cap_path: String,
     sniffer_exe: String,
 }
 
 impl App {
-    pub fn new(scripts_dir: String, connect: Option<String>, wave: bool) -> App {
-        let (tx, rx) = worker::spawn();
+    pub fn new(
+        scripts_dir: String,
+        connect: Option<String>,
+        wave: bool,
+        ctx: egui::Context,
+    ) -> App {
+        let (tx, rx) = worker::spawn(move || ctx.request_repaint());
         let mut a = App {
             tx,
             rx,
@@ -102,6 +111,8 @@ impl App {
             hist_pos: None,
             log_errors_only: false,
             runs: Vec::new(),
+            resume: None,
+            last_resume: std::time::Instant::now(),
             scripts_dir,
             cap_path: String::new(),
             sniffer_exe: std::env::var("SNIFFER_EXE").unwrap_or_else(|_| {
@@ -154,7 +165,17 @@ impl App {
                     self.connected = Some((serial, board, ident));
                     self.err = None;
                     self.pushed = None;
-                    self.tab = Tab::Capture;
+                    // Jump to Capture on a connect the person asked for, not
+                    // on the one that follows a script.
+                    //
+                    // A bench run ends, the window takes the board back, and
+                    // the tab changed under whoever was reading the result -
+                    // which is the moment they least want to be moved. resume
+                    // is still set here; it is cleared once the connection is
+                    // seen.
+                    if self.resume.is_none() {
+                        self.tab = Tab::Capture;
+                    }
                 }
                 Evt::Disconnected => {
                     self.connected = None;
@@ -215,8 +236,42 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.pump();
+        let was_busy = self.runs.iter().any(|r| !r.done);
         for r in self.runs.iter_mut() {
             r.pump();
+        }
+        // Take the board back when the last script lets go of it.
+        //
+        // The window disconnected itself to hand the board over, so leaving it
+        // disconnected afterwards is a state nobody chose: every control is
+        // dead and the only clue is a chip in the corner. Restoring what was
+        // there before is the least surprising thing it can do.
+        if was_busy && !self.runs.iter().any(|r| !r.done) {
+            // Asked for, not taken. The script's process can still hold the
+            // USB interface for a moment after it exits, so the first attempt
+            // can be refused - and a `take()` here spent the only chance on
+            // it. The request is repeated below until it lands.
+            if let Some(serial) = self.resume.clone() {
+                self.send(Req::Connect(serial));
+            }
+        }
+        if self.resume.is_some() {
+            if self.connected.is_some() {
+                self.resume = None;
+            } else if !self.runs.iter().any(|r| !r.done) {
+                // Half a second between attempts, which is long enough for the
+                // handle to be released and short enough not to be noticed.
+                let now = std::time::Instant::now();
+                if now.duration_since(self.last_resume)
+                    > std::time::Duration::from_millis(500)
+                {
+                    self.last_resume = now;
+                    if let Some(serial) = self.resume.clone() {
+                        self.send(Req::Connect(serial));
+                    }
+                }
+                ctx_repaint(ui);
+            }
         }
         // A live capture and a running script both change the window without
         // any input, so the frame has to be asked for rather than waited on.
@@ -774,7 +829,8 @@ impl App {
     fn start_script(&mut self, script: &str, args: &[String]) {
         // The script needs the board, and this window has it. Hand it over
         // rather than letting the script fail to open it.
-        if self.connected.is_some() {
+        if let Some((serial, _, _)) = self.connected.clone() {
+            self.resume = Some(serial);
             self.send(Req::Disconnect);
         }
         self.runs.push(Run::python(&self.scripts_dir, script, args));
@@ -994,6 +1050,13 @@ impl App {
             });
         ui.add_space(3.0);
     }
+}
+
+/// Ask for another frame soon, for the cases that are waiting on a timer
+/// rather than on the worker.
+fn ctx_repaint(ui: &egui::Ui) {
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(200));
 }
 
 /// What colour a token is, in one place.

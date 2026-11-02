@@ -80,6 +80,13 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "busbridge-rt-gui",
         opts,
-        Box::new(move |_cc| Ok(Box::new(app::App::new(scripts, connect, wave)))),
+        Box::new(move |cc| {
+            Ok(Box::new(app::App::new(
+                scripts,
+                connect,
+                wave,
+                cc.egui_ctx.clone(),
+            )))
+        }),
     )
 }

@@ -47,7 +47,8 @@ pub fn run(serial_prefix: Option<String>) -> i32 {
         return 1;
     };
 
-    let (tx, rx) = worker::spawn();
+    // No window to wake.
+    let (tx, rx) = worker::spawn(|| {});
     let _ = tx.send(Req::Connect(info.serial.clone()));
 
     // Connect

@@ -96,17 +96,43 @@ pub enum Evt {
     Error(String),
 }
 
-pub fn spawn() -> (Sender<Req>, Receiver<Evt>) {
+/// Start the worker.
+///
+/// `wake` is called after every event is queued, and it is not optional.
+///
+/// egui only draws when something asks it to. Without this the window showed
+/// whatever was true at the last frame and nothing else: a capture finished,
+/// the board was reconnected, the worker sent Connected - and the title bar
+/// went on saying "not connected" until a mouse moved over the window. The
+/// state was right and the picture was stale, which is the worst of both,
+/// because the picture is the only thing anyone checks.
+pub fn spawn(wake: impl Fn() + Send + 'static) -> (Sender<Req>, Receiver<Evt>) {
     let (tx_req, rx_req) = std::sync::mpsc::channel::<Req>();
     let (tx_evt, rx_evt) = std::sync::mpsc::channel::<Evt>();
     std::thread::Builder::new()
         .name("board".into())
-        .spawn(move || run(rx_req, tx_evt))
+        .spawn(move || run(rx_req, Waker { tx: tx_evt, wake }))
         .expect("worker thread");
     (tx_req, rx_evt)
 }
 
-fn run(rx: Receiver<Req>, tx: Sender<Evt>) {
+/// The send side, with the repaint attached.
+///
+/// A struct rather than two arguments threaded through every function, so a
+/// send that forgets to wake is not something that can be written.
+pub struct Waker<F: Fn()> {
+    tx: Sender<Evt>,
+    wake: F,
+}
+
+impl<F: Fn()> Waker<F> {
+    fn send(&self, e: Evt) {
+        let _ = self.tx.send(e);
+        (self.wake)();
+    }
+}
+
+fn run<F: Fn()>(rx: Receiver<Req>, tx: Waker<F>) {
     let mut dev: Option<Device> = None;
     let mut following = false;
     let mut raw = false;
@@ -141,7 +167,7 @@ fn run(rx: Receiver<Req>, tx: Sender<Evt>) {
                     following = false;
                     match Device::open(&serial) {
                         Ok(d) => {
-                            let _ = tx.send(Evt::Connected {
+                            tx.send(Evt::Connected {
                                 serial: d.serial.clone(),
                                 board: d.board,
                                 ident: d.ident.clone(),
@@ -149,14 +175,14 @@ fn run(rx: Receiver<Req>, tx: Sender<Evt>) {
                             dev = Some(d);
                         }
                         Err(e) => {
-                            let _ = tx.send(Evt::Error(e));
+                            tx.send(Evt::Error(e));
                         }
                     }
                 }
                 Req::Disconnect => {
                     dev = None;
                     following = false;
-                    let _ = tx.send(Evt::Disconnected);
+                    tx.send(Evt::Disconnected);
                 }
                 Req::Follow(on) => {
                     following = on && dev.is_some();
@@ -164,7 +190,7 @@ fn run(rx: Receiver<Req>, tx: Sender<Evt>) {
                 }
                 Req::RawStart(budget) => {
                     let Some(d) = dev.as_ref() else {
-                        let _ = tx.send(Evt::Error("not connected".into()));
+                        tx.send(Evt::Error("not connected".into()));
                         continue;
                     };
                     let line = format!("SNIFF:RAW:START {budget}");
@@ -176,7 +202,7 @@ fn run(rx: Receiver<Req>, tx: Sender<Evt>) {
                         // the engine's to choose. Drawing a time axis from the
                         // requested rate would be a plausible wrong answer.
                         let hz = device::field_u64(&r, "tick_hz=").unwrap_or(10_000_000);
-                        let _ = tx.send(Evt::RawArmed(hz));
+                        tx.send(Evt::RawArmed(hz));
                         raw = true;
                         following = true;
                         next_poll = Instant::now();
@@ -197,7 +223,7 @@ fn run(rx: Receiver<Req>, tx: Sender<Evt>) {
                         tracing = c.source != "wire";
                     }
                     let Some(d) = dev.as_ref() else {
-                        let _ = tx.send(Evt::Error("not connected".into()));
+                        tx.send(Evt::Error("not connected".into()));
                         continue;
                     };
                     handle(d, other, &tx, &mut following, &mut raw);
@@ -240,14 +266,14 @@ fn run(rx: Receiver<Req>, tx: Sender<Evt>) {
     }
 }
 
-fn say(tx: &Sender<Evt>, cmd: &str, reply: String) {
-    let _ = tx.send(Evt::Reply {
+fn say<F: Fn()>(tx: &Waker<F>, cmd: &str, reply: String) {
+    tx.send(Evt::Reply {
         cmd: cmd.to_string(),
         reply,
     });
 }
 
-fn handle(d: &Device, req: Req, tx: &Sender<Evt>, following: &mut bool, raw: &mut bool) {
+fn handle<F: Fn()>(d: &Device, req: Req, tx: &Waker<F>, following: &mut bool, raw: &mut bool) {
     match req {
         Req::Raw(line) => {
             let r = d.command(&line);
@@ -280,7 +306,7 @@ fn handle(d: &Device, req: Req, tx: &Sender<Evt>, following: &mut bool, raw: &mu
                 if bad {
                     // Stop at the first refusal rather than pushing the rest
                     // onto a configuration the board has already rejected.
-                    let _ = tx.send(Evt::Error(format!("configuration stopped at: {l}")));
+                    tx.send(Evt::Error(format!("configuration stopped at: {l}")));
                     return;
                 }
             }
@@ -325,13 +351,13 @@ fn handle(d: &Device, req: Req, tx: &Sender<Evt>, following: &mut bool, raw: &mu
             let r = d.command("SNIFF:TRACE? 60");
             if Device::ok(&r) {
                 let hz = device::field_u64(&r, "cycle_hz=").unwrap_or(240_000_000);
-                let _ = tx.send(Evt::Marks(device::marks(&r), hz));
+                tx.send(Evt::Marks(device::marks(&r), hz));
             }
             say(tx, "SNIFF:TRACE? 60", r);
         }
         Req::Status => {
             let r = d.command("SNIFF:STAT?");
-            let _ = tx.send(Evt::Status(r.clone()));
+            tx.send(Evt::Status(r.clone()));
             say(tx, "SNIFF:STAT?", r);
         }
         _ => {}
@@ -350,7 +376,7 @@ fn handle(d: &Device, req: Req, tx: &Sender<Evt>, following: &mut bool, raw: &mu
 /// it at BB_REPLY_BYTES_MAX and asking for more gets a refusal rather than a
 /// long line. Asking for exactly the maximum keeps the round trips down on a
 /// busy bus, where the waveform is the thing most likely to fall behind.
-fn drain_raw(d: &Device, tx: &Sender<Evt>) {
+fn drain_raw<F: Fn()>(d: &Device, tx: &Waker<F>) {
     for _ in 0..8 {
         let r = d.command("SNIFF:RAW:READ? 79");
         if !Device::ok(&r) {
@@ -361,7 +387,7 @@ fn drain_raw(d: &Device, tx: &Sender<Evt>) {
             return;
         }
         let whole = payload.split_whitespace().count() == 79 * 5;
-        let _ = tx.send(Evt::RawData(r));
+        tx.send(Evt::RawData(r));
         if !whole {
             // Short reply: the board has handed over what it had. Coming back
             // immediately would spin against an idle bus.
@@ -375,7 +401,7 @@ fn drain_raw(d: &Device, tx: &Sender<Evt>) {
 /// Quiet - no entry in the transcript. This runs twenty times a second while a
 /// capture is live, and a log that is nine tenths its own polling is a log
 /// nobody reads.
-fn peek_trace(d: &Device, tx: &Sender<Evt>) {
+fn peek_trace<F: Fn()>(d: &Device, tx: &Waker<F>) {
     let r = d.command("SNIFF:TRACE? 60");
     if !Device::ok(&r) {
         return;
@@ -383,17 +409,17 @@ fn peek_trace(d: &Device, tx: &Sender<Evt>) {
     let m = device::marks(&r);
     if !m.is_empty() {
         let hz = device::field_u64(&r, "cycle_hz=").unwrap_or(240_000_000);
-        let _ = tx.send(Evt::Marks(m, hz));
+        tx.send(Evt::Marks(m, hz));
     }
 }
 
-fn drain_events(d: &Device, tx: &Sender<Evt>) {
+fn drain_events<F: Fn()>(d: &Device, tx: &Waker<F>) {
     let r = d.command("SNIFF:READ? 120");
     if !Device::ok(&r) {
         return;
     }
     let toks = device::tokens(&r);
     if !toks.is_empty() {
-        let _ = tx.send(Evt::Events(toks));
+        tx.send(Evt::Events(toks));
     }
 }
